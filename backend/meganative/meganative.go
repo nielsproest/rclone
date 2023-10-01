@@ -36,6 +36,7 @@ type Options struct {
 	Debug    bool                 `config:"debug"`
 	UseHTTPS bool                 `config:"use_https"`
 	Enc      encoder.MultiEncoder `config:"encoding"`
+	// TODO: Hard-delete and the rest
 }
 
 // Fs represents a remote mega
