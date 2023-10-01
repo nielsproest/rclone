@@ -171,3 +171,8 @@ require (
 	golang.org/x/mobile v0.0.0-20230531173138-3c911d8e3eda
 	golang.org/x/term v0.12.0
 )
+
+
+replace rclone/megasdk => ./megasdk
+
+require rclone/megasdk v0.0.0-00010101000000-000000000000
