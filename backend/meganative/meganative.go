@@ -22,6 +22,16 @@ import (
 	"github.com/rclone/rclone/lib/pacer"
 )
 
+/*
+ * See megaapi.h for source
+ * Read MEGAdokan.cpp for a full fs driver, use this as main source, but also a little wrong download
+ * Read megacli.php for a full client, but with some wrong download/upload args
+ * Read megafuse.cpp for nice c++ code
+ * Read https://mega.io/developers
+ *
+ * TODO: Find out about the state files that are generated
+ */
+
 const (
 	minSleep      = 10 * time.Millisecond
 	maxSleep      = 2 * time.Second
@@ -160,6 +170,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	director := mega.NewDirectorMegaListener(&listenerObj)
 	listenerObj.director = &director
 
+	// TODO: Generate code at: https://mega.co.nz/#sdk
 	srv := mega.NewMegaApi("ht1gUZLZ", "", "MEGA/SDK rclone indev")
 	srv.AddListener(director)
 
@@ -196,11 +207,12 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 
 	// Find the root node and check if it is a file or not
 	fs.Debugf("mega-native", "Retrieving root node...")
-	rootNode := srv.GetNodeByPath(root)
+	rootNode := srv.GetRootNode()
 	if rootNode.Swigcptr() == 0 {
 		return nil, fmt.Errorf("couldn't find root node")
 	}
 
+	// TODO: Create folder if missing
 	switch rootNode.GetType() {
 	case mega.MegaNodeTYPE_FOLDER:
 		// root node found and is a directory
@@ -266,7 +278,6 @@ func parsePath(path string) (root string) {
 	if !strings.HasPrefix(root, "/") {
 		root = "/" + root
 	}
-	root = strings.TrimSuffix(root, "/")
 	return
 }
 
@@ -284,8 +295,34 @@ func nodeToUnique(node *mega.MegaNode) string {
 
 // Mkdir implements fs.Fs.
 func (f *Fs) Mkdir(ctx context.Context, dir string) error {
-	// TODO: .
-	return fmt.Errorf("unimplemented")
+	dir = strings.TrimSuffix(f.root+"/"+dir, "/")
+
+	n := (*f.srv).GetNodeByPath(dir)
+	if n.Swigcptr() != 0 {
+		return fmt.Errorf("path already exists")
+	}
+
+	index := strings.LastIndex(dir, "/")
+	parentDir := dir[:index+1]
+	n = (*f.srv).GetNodeByPath(parentDir)
+	if n.Swigcptr() == 0 || n.IsFile() {
+		return fmt.Errorf("parent folder not found")
+	}
+
+	listenerObj := MyMegaListener{}
+	listenerObj.cv = sync.NewCond(&listenerObj.m)
+	listener := mega.NewDirectorMegaRequestListener(&listenerObj)
+
+	(*f.srv).CreateFolder(dir[index+1:], n, listener)
+	listenerObj.Wait()
+	defer listenerObj.Reset()
+
+	if (*listenerObj.GetError()).GetErrorCode() != mega.MegaErrorAPI_OK {
+		return fmt.Errorf("error creating folder")
+	}
+
+	fs.Debugf(f, "Folder created OK")
+	return nil
 }
 
 // NewObject implements fs.Fs.
@@ -357,13 +394,37 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 
 // Remove implements fs.Object.
 func (o *Object) Remove(ctx context.Context) error {
-	// TODO: .
-	return fmt.Errorf("unimplemented")
+	// TODO: Test this
+	_n := o.info
+	if _n == nil {
+		return fmt.Errorf("file not found")
+	}
+	n := *_n
+
+	if !n.IsFile() {
+		return fmt.Errorf("the path isn't a file")
+	}
+
+	listenerObj := MyMegaListener{}
+	listenerObj.cv = sync.NewCond(&listenerObj.m)
+	listener := mega.NewDirectorMegaRequestListener(&listenerObj)
+
+	(*o.fs.srv).Remove(n, listener)
+	listenerObj.Wait()
+	defer listenerObj.Reset()
+
+	if (*listenerObj.GetError()).GetErrorCode() != mega.MegaErrorAPI_OK {
+		return fmt.Errorf("error deleting file")
+	}
+
+	fs.Debugf(o.fs, "File deleted OK")
+	return nil
 }
 
 // SetModTime implements fs.Object.
 func (o *Object) SetModTime(ctx context.Context, t time.Time) error {
-	return fmt.Errorf("unavailable with this remote")
+	// TODO: .
+	return fmt.Errorf("unimplemented")
 }
 
 // Storable implements fs.Object.
@@ -443,7 +504,7 @@ func (f *Fs) PublicLink(ctx context.Context, remote string, expire fs.Duration, 
 
 // DirCacheFlush implements fs.DirCacheFlusher.
 func (f *Fs) DirCacheFlush() {
-	(*f.srv).Catchup()
+	// (*f.srv).Catchup()
 	// TODO: Should i wait for this?
 }
 
