@@ -451,7 +451,7 @@ func (o *Object) Size() int64 {
 	if o.info != nil {
 		return (*o.info).GetSize()
 	}
-	return 0
+	return -1
 }
 
 // String implements fs.DirEntry.
@@ -471,7 +471,9 @@ func (o *Object) Fs() fs.Info {
 
 // Hash implements fs.Object.
 func (o *Object) Hash(ctx context.Context, ty hash.Type) (string, error) {
-	return nodeToUnique(o.info), nil
+	// Is reportedly a: Base64-encoded CRC of the node
+	// But i cant figure it out
+	return (*o.fs.srv).GetCRC(*o.info), nil
 }
 
 // Open implements fs.Object.
@@ -483,6 +485,12 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 // Remove implements fs.Object.
 func (o *Object) Remove(ctx context.Context) error {
 	// TODO: Test this
+	// TODO: BROKEN
+	/*
+		2023/10/02 14:30:32 ERROR : Attempt 1/3 failed with 1 errors and: test:test.txt is a directory or doesn't exist: object not found
+	*/
+	return fmt.Errorf("broken")
+
 	if o.info == nil {
 		return fmt.Errorf("file not found")
 	}
@@ -509,6 +517,13 @@ func (o *Object) Remove(ctx context.Context) error {
 	return nil
 }
 
+// Update implements fs.Object.
+func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) error {
+	// TODO: Test this
+	_, err := (*o.fs).write(ctx, o, in, src, false)
+	return err
+}
+
 // SetModTime implements fs.Object.
 func (o *Object) SetModTime(ctx context.Context, t time.Time) error {
 	return fs.ErrorCantSetModTime
@@ -518,13 +533,6 @@ func (o *Object) SetModTime(ctx context.Context, t time.Time) error {
 func (o *Object) Storable() bool {
 	// TODO: .
 	return true
-}
-
-// Update implements fs.Object.
-func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) error {
-	// TODO: .
-	fmt.Printf("what\n")
-	return fmt.Errorf("unimplemented")
 }
 
 // ------------------------------------------------------------
@@ -560,26 +568,10 @@ func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object,
 	return dstObj, fmt.Errorf("unimplemented")
 }
 
-/*
-2023/10/02 13:50:04 DEBUG : notes.txt: Need to transfer - File not found at Destination
-2023/10/02 13:50:04 ERROR : notes.txt: corrupted on transfer: sizes differ 1497 vs 0
-2023/10/02 13:50:04 INFO  : notes.txt: Removing failed copy
-2023/10/02 13:50:04 INFO  : notes.txt: Failed to remove failed copy: file not found
-2023/10/02 13:50:04 ERROR : Attempt 1/3 failed with 1 errors and: corrupted on transfer: sizes differ 1497 vs 0
-2023/10/02 13:50:04 DEBUG : notes.txt: Size and modification time the same (differ by -183.044725ms, within tolerance 1s)
-2023/10/02 13:50:04 DEBUG : notes.txt: Unchanged skipping
-2023/10/02 13:50:04 ERROR : Attempt 2/3 succeeded
-TODO: Why?
-*/
-func (f *Fs) PutUnchecked(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
-	dstObj := &Object{
-		fs:     f,
-		remote: src.Remote(),
-	}
-
+func (f *Fs) write(ctx context.Context, dstObj *Object, in io.Reader, src fs.ObjectInfo, ignore_exist bool) (*Object, error) {
 	dir := dstObj.FixPath()
 	node := (*f.srv).GetNodeByPath(dir)
-	if node.Swigcptr() != 0 {
+	if node.Swigcptr() != 0 && !ignore_exist {
 		return dstObj, fmt.Errorf("file exists")
 	}
 
@@ -623,6 +615,15 @@ func (f *Fs) PutUnchecked(ctx context.Context, in io.Reader, src fs.ObjectInfo, 
 	defer listenerObj.Reset()
 
 	return dstObj, nil
+}
+
+func (f *Fs) PutUnchecked(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
+	dstObj := &Object{
+		fs:     f,
+		remote: src.Remote(),
+	}
+
+	return f.write(ctx, dstObj, in, src, false)
 }
 
 func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string) error {
