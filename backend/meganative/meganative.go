@@ -60,6 +60,7 @@ const (
 type Options struct {
 	User       string               `config:"user"`
 	Pass       string               `config:"pass"`
+	Cache      string               `config:"cache"`
 	Debug      bool                 `config:"debug"`
 	HardDelete bool                 `config:"hard_delete"`
 	UseHTTPS   bool                 `config:"use_https"`
@@ -137,6 +138,12 @@ func init() {
 			Required:   true,
 			IsPassword: true,
 		}, {
+			Name:     "cache",
+			Help:     "MEGA State cache folder.",
+			Default:  "",
+			Required: false,
+			Advanced: true,
+		}, {
 			Name: "debug",
 			Help: `Output more debug from Mega.
 
@@ -197,7 +204,11 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	director := mega.NewDirectorMegaListener(&listenerObj)
 
 	// TODO: Generate code at: https://mega.co.nz/#sdk
-	srv := mega.NewMegaApi("ht1gUZLZ", "", "MEGA/SDK Rclone filesystem")
+	srv := mega.NewMegaApi(
+		"ht1gUZLZ",                   // appKey
+		"megacache",                  // basePath
+		"MEGA/SDK Rclone filesystem", // userAgent
+		uint(4))                      // workerThreadCount
 	srv.AddListener(director)
 
 	srv.UseHttpsOnly(opt.UseHTTPS)
@@ -232,13 +243,13 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 
 	// Find the root node and check if it is a file or not
 	fs.Debugf("mega-native", "Retrieving root node...")
-	rootNode := srv.GetRootNode()
+	rootNode := srv.GetNodeByPath(root)
 	if rootNode.Swigcptr() == 0 {
 		return nil, fmt.Errorf("couldn't find root node")
 	}
 
 	// TODO: Create folder if missing (or dont?)
-	switch rootNode.GetType() {
+	/*switch rootNode.GetType() {
 	case mega.MegaNodeTYPE_FOLDER:
 		// root node found and is a directory
 	case mega.MegaNodeTYPE_FILE:
@@ -248,8 +259,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 			root = ""
 		}
 		f.root = root
-		return f, err
-	}
+	}*/
 	fs.Debugf("mega-native", "Ready!")
 
 	return f, nil
@@ -259,19 +269,10 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 
 // parsePath parses a mega 'url'
 func parsePath(path string) (root string) {
-	root = strings.Trim(path, "/")
+	fmt.Printf("HERE10 %s\n", path)
+	root = "/" + strings.TrimSuffix(path, "/")
+	fmt.Printf("HERE10.1 %s\n", root)
 	return
-}
-
-// With mega-sdk, the root is ALWAYS /
-func (f *Fs) ParsePath(dir string) string {
-	dir = strings.TrimSuffix(dir, "/")
-
-	if !strings.HasPrefix(dir, "/") {
-		dir = "/" + dir
-	}
-
-	return dir
 }
 
 // Converts any mega unix time to time.Time
@@ -279,14 +280,10 @@ func intToTime(num int64) time.Time {
 	return time.Unix(num, 0)
 }
 
-// Parses the unique id
-func (o *Object) FixPath() string {
-	return o.fs.ParsePath(o.remote)
-}
-
 // findDir finds the directory rooted from the node passed in
 func (f *Fs) findDir(dir string) (*mega.MegaNode, error) {
-	n := (*f.srv).GetNodeByPath(f.ParsePath(dir))
+	fmt.Printf("HERE7\n")
+	n := (*f.srv).GetNodeByPath(parsePath(dir))
 	if n.Swigcptr() == 0 {
 		return nil, fs.ErrorDirNotFound
 	} else if n.Swigcptr() != 0 && n.GetType() == mega.MegaNodeTYPE_FILE {
@@ -297,7 +294,8 @@ func (f *Fs) findDir(dir string) (*mega.MegaNode, error) {
 
 // findObject looks up the node for the object of the name given
 func (f *Fs) findObject(file string) (*mega.MegaNode, error) {
-	n := (*f.srv).GetNodeByPath(f.ParsePath(file))
+	fmt.Printf("HERE8\n")
+	n := (*f.srv).GetNodeByPath(parsePath(file))
 	if n.Swigcptr() == 0 {
 		return nil, fs.ErrorObjectNotFound
 	} else if n.Swigcptr() != 0 && n.GetType() != mega.MegaNodeTYPE_FILE {
@@ -326,6 +324,7 @@ func (f *Fs) hardDelete(node mega.MegaNode) error {
 
 // List implements fs.Fs.
 func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err error) {
+	fmt.Printf("HERE9\n")
 	dirNode, err := f.findDir(dir)
 	if err != nil {
 		return nil, err
@@ -338,12 +337,8 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 
 	for i := 0; i < children.Size(); i++ {
 		node := children.Get(i)
-
 		remote := path.Join(dir, f.opt.Enc.ToStandardName(node.GetName()))
-		// While MEGA-SDK explicitly needs / as thats the root
-		// Normal filesystems dont like that
-		remote = strings.TrimPrefix(remote, "/")
-
+		fmt.Printf("dir %s\n", remote)
 		switch node.GetType() {
 		case mega.MegaNodeTYPE_FOLDER:
 			modTime := intToTime(node.GetModificationTime())
@@ -365,6 +360,7 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 
 // Mkdir implements fs.Fs.
 func (f *Fs) Mkdir(ctx context.Context, dir string) error {
+	fmt.Printf("HERE11\n")
 	_, err := f.findDir(dir)
 	if err == nil {
 		return fmt.Errorf("Mkdir failed: %w", err)
@@ -396,15 +392,18 @@ func (f *Fs) Mkdir(ctx context.Context, dir string) error {
 
 // NewObject implements fs.Fs.
 func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
+	fmt.Printf("HERE3\n")
 	o := &Object{
 		fs:     f,
 		remote: remote,
 	}
 
-	fmt.Printf("TEST5: %s\n", o.FixPath())
-	n, err := f.findObject(remote)
-	if err == nil {
-		o.info = n
+	var err error
+	n := (*f.srv).GetNodeByPath(remote)
+	if n.Swigcptr() != 0 {
+		o.info = &n
+	} else {
+		err = fs.ErrorObjectNotFound
 	}
 
 	return o, err
@@ -417,6 +416,8 @@ func (f *Fs) Precision() time.Duration {
 
 // Put implements fs.Fs.
 func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
+	fmt.Printf("HERE11\n")
+	// TODO: write literally does all of this, move this logic out of here
 	existingObj, err := f.findObject(src.Remote())
 	if err != nil {
 		return f.PutUnchecked(ctx, in, src)
@@ -433,9 +434,9 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options .
 
 // Rmdir implements fs.Fs.
 func (f *Fs) Rmdir(ctx context.Context, dir string) error {
+	fmt.Printf("PATH2: %s\n", dir)
 	// TODO: Test this
 	n, err := f.findDir(dir)
-	fmt.Printf("PATH2: %s\n", dir)
 	if err != nil {
 		return err
 	}
@@ -479,7 +480,7 @@ func (o *Object) Remote() string {
 
 // Size implements fs.DirEntry.
 func (o *Object) Size() int64 {
-	fmt.Printf("test1\n")
+	fmt.Printf("HERE4\n")
 	if o.info != nil {
 		return (*o.info).GetSize()
 	}
@@ -488,6 +489,7 @@ func (o *Object) Size() int64 {
 
 // String implements fs.DirEntry.
 func (o *Object) String() string {
+	fmt.Printf("test3\n")
 	if o == nil {
 		return "<nil>"
 	}
@@ -551,6 +553,7 @@ func (o *Object) Remove(ctx context.Context) error {
 
 // Update implements fs.Object.
 func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) error {
+	fmt.Printf("HERE5\n")
 	// TODO: Test this
 	_, err := (*o.fs).write(ctx, o, in, src, false)
 	return err
@@ -578,6 +581,7 @@ func (f *Fs) Purge(ctx context.Context, dir string) error {
 }
 
 func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object, error) {
+	fmt.Printf("HERE12\n")
 	dstFs := f
 
 	//log.Printf("Move %q -> %q", src.Remote(), remote)
@@ -600,12 +604,13 @@ func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object,
 }
 
 func (f *Fs) write(ctx context.Context, dstObj *Object, in io.Reader, src fs.ObjectInfo, ignore_exist bool) (*Object, error) {
+	fmt.Printf("HERE1\n")
 	node, err := f.findObject(dstObj.remote)
 	if err != nil && !ignore_exist {
 		return dstObj, err
 	}
 
-	dir := f.ParsePath(dstObj.remote)
+	dir := parsePath(dstObj.remote)
 	index := strings.LastIndex(dir, "/")
 	parentDir := dir[:index+1]
 	fileName := dir[index+1:]
@@ -619,7 +624,10 @@ func (f *Fs) write(ctx context.Context, dstObj *Object, in io.Reader, src fs.Obj
 	if err != nil {
 		return dstObj, fmt.Errorf("failed to create temporary file")
 	}
+	defer os.Remove(tempFile.Name())
 
+	// Unlike downloads, there is no upload bytes interface
+	// It must be a file, so we create a temporary one
 	_, err = io.Copy(tempFile, in)
 	if err != nil {
 		return dstObj, fmt.Errorf("failed to write temporary file")
@@ -631,13 +639,14 @@ func (f *Fs) write(ctx context.Context, dstObj *Object, in io.Reader, src fs.Obj
 
 	token := mega.MegaCancelTokenCreateInstance()
 
+	// Somebody contact MEGA, ask them for a upload bytes interface :P
 	(*f.srv).StartUpload(
 		tempFile.Name(),         //Localpath
 		*pnode,                  //Directory
 		fileName,                //Filename
 		src.ModTime(ctx).Unix(), //Modification time
 		"",                      // Temporary directory
-		true,                    // Temporary source
+		false,                   // Temporary source
 		false,                   // Priority
 		token,                   // Cancel token
 		listener,                //Listener
@@ -698,7 +707,7 @@ func (f *Fs) MergeDirs(ctx context.Context, dirs []fs.Directory) error {
 
 // PublicLink implements fs.PublicLinker.
 func (f *Fs) PublicLink(ctx context.Context, remote string, expire fs.Duration, unlink bool) (string, error) {
-	node := (*f.srv).GetNodeByPath(f.ParsePath(remote))
+	node := (*f.srv).GetNodeByPath(parsePath(remote))
 	if node.Swigcptr() == 0 {
 		return "", fmt.Errorf("object not found")
 	}
