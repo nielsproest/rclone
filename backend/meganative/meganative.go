@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"os"
 	"path"
 	"strconv"
 	"strings"
@@ -22,9 +23,17 @@ import (
 	"github.com/rclone/rclone/lib/pacer"
 )
 
+// STRONG WARNING:
+// This is from SWIG bindings of a C++ project
+// There is insane amounts of pointer fuckery
+// The code below in almost no way resembles normal golang code
+// So for your safety, if you are dainty about golang code
+// Do not scroll further down
+
 /*
- * See megaapi.h for source
+ * See megaapi.h for source documentation
  * Read MEGAdokan.cpp for a full fs driver, use this as main source, but also a little wrong download
+ *
  * Read megacli.php for a full client, but with some wrong download/upload args
  * Read megafuse.cpp for nice c++ code
  * Read https://mega.io/developers
@@ -168,10 +177,11 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	listenerObj := MyMegaListener{}
 	listenerObj.cv = sync.NewCond(&listenerObj.m)
 	director := mega.NewDirectorMegaListener(&listenerObj)
+	// TODO: Do i need this reference?
 	listenerObj.director = &director
 
 	// TODO: Generate code at: https://mega.co.nz/#sdk
-	srv := mega.NewMegaApi("ht1gUZLZ", "", "MEGA/SDK rclone indev")
+	srv := mega.NewMegaApi("ht1gUZLZ", "", "MEGA/SDK Rclone filesystem")
 	srv.AddListener(director)
 
 	srv.UseHttpsOnly(opt.UseHTTPS)
@@ -212,7 +222,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		return nil, fmt.Errorf("couldn't find root node")
 	}
 
-	// TODO: Create folder if missing
+	// TODO: Create folder if missing (or dont?)
 	switch rootNode.GetType() {
 	case mega.MegaNodeTYPE_FOLDER:
 		// root node found and is a directory
@@ -229,6 +239,49 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 
 	return f, nil
 }
+
+// ------------------------------------------------------------
+
+// parsePath parses a mega 'url'
+// With mega-sdk, the root is ALWAYS /
+func parsePath(path string) (root string) {
+	root = path
+	if !strings.HasPrefix(root, "/") {
+		root = "/" + root
+	}
+	return
+}
+
+func (f *Fs) ParsePath(dir string) string {
+	dir = strings.TrimSuffix(dir, "/")
+
+	if f.root == "/" {
+		return fmt.Sprintf("%s%s", f.root, dir)
+	}
+
+	return fmt.Sprintf("%s/%s", f.root, dir)
+}
+
+// Converts any mega unix time to time.Time
+func intToTime(num int64) time.Time {
+	return time.Unix(num, 0)
+}
+
+// Creates a unique id for each node
+func nodeToUnique(node *mega.MegaNode) string {
+	return strconv.FormatInt((*node).GetHandle(), 10)
+}
+
+// Parses the unique id
+func (o *Object) Unique() int64 {
+	val, _ := strconv.ParseInt(o.ID(), 10, 64)
+	return val
+}
+func (o *Object) FixPath() string {
+	return o.fs.ParsePath(o.remote)
+}
+
+// ------------------------------------------------------------
 
 // List implements fs.Fs.
 func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err error) {
@@ -248,12 +301,14 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 		node := children.Get(i)
 
 		remote := path.Join(dir, f.opt.Enc.ToStandardName(node.GetName()))
+		// While MEGA-SDK explicitly needs / as thats the root
+		// Normal filesystems dont like that
 		remote = strings.TrimPrefix(remote, "/")
 
 		switch node.GetType() {
 		case mega.MegaNodeTYPE_FOLDER:
 			modTime := intToTime(node.GetModificationTime())
-			d := fs.NewDir(remote, modTime).SetID(nodeToUnique(&node))
+			d := fs.NewDir(remote, modTime).SetID(nodeToUnique(&node)).SetParentID(nodeToUnique(&dirNode))
 			entries = append(entries, d)
 		case mega.MegaNodeTYPE_FILE:
 			o := &Object{
@@ -269,33 +324,9 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 	return entries, nil
 }
 
-// ------------------------------------------------------------
-
-// parsePath parses a mega 'url'
-// With mega-sdk, the root is ALWAYS /
-func parsePath(path string) (root string) {
-	root = path
-	if !strings.HasPrefix(root, "/") {
-		root = "/" + root
-	}
-	return
-}
-
-// Converts any mega unix time to time.Time
-func intToTime(num int64) time.Time {
-	return time.Unix(num, 0)
-}
-
-// Creates a unique id for each node
-func nodeToUnique(node *mega.MegaNode) string {
-	return strconv.FormatInt((*node).GetHandle(), 10)
-}
-
-// ------------------------------------------------------------
-
 // Mkdir implements fs.Fs.
 func (f *Fs) Mkdir(ctx context.Context, dir string) error {
-	dir = strings.TrimSuffix(f.root+"/"+dir, "/")
+	dir = f.ParsePath(dir)
 
 	n := (*f.srv).GetNodeByPath(dir)
 	if n.Swigcptr() != 0 {
@@ -304,6 +335,7 @@ func (f *Fs) Mkdir(ctx context.Context, dir string) error {
 
 	index := strings.LastIndex(dir, "/")
 	parentDir := dir[:index+1]
+	fileName := dir[index+1:]
 	n = (*f.srv).GetNodeByPath(parentDir)
 	if n.Swigcptr() == 0 || n.IsFile() {
 		return fmt.Errorf("parent folder not found")
@@ -313,7 +345,7 @@ func (f *Fs) Mkdir(ctx context.Context, dir string) error {
 	listenerObj.cv = sync.NewCond(&listenerObj.m)
 	listener := mega.NewDirectorMegaRequestListener(&listenerObj)
 
-	(*f.srv).CreateFolder(dir[index+1:], n, listener)
+	(*f.srv).CreateFolder(fileName, n, listener)
 	listenerObj.Wait()
 	defer listenerObj.Reset()
 
@@ -327,8 +359,21 @@ func (f *Fs) Mkdir(ctx context.Context, dir string) error {
 
 // NewObject implements fs.Fs.
 func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
-	// TODO: .
-	return nil, fmt.Errorf("unimplemented")
+	o := &Object{
+		fs:     f,
+		remote: remote,
+	}
+
+	n := (*f.srv).GetNodeByPath(o.FixPath())
+	if n.Swigcptr() == 0 {
+		return o, fs.ErrorObjectNotFound
+	}
+	if !n.IsFile() {
+		return o, fs.ErrorIsDir
+	}
+
+	o.info = &n
+	return o, nil
 }
 
 // Precision implements fs.Fs.
@@ -338,21 +383,62 @@ func (f *Fs) Precision() time.Duration {
 
 // Put implements fs.Fs.
 func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
-	// TODO: .
-	return nil, fmt.Errorf("unimplemented")
+	existingObj := (*f.srv).GetNodeByPath(f.ParsePath(src.Remote()))
+	if existingObj.Swigcptr() == 0 {
+		return f.PutUnchecked(ctx, in, src)
+	}
+
+	o := &Object{
+		fs:     f,
+		remote: src.Remote(),
+		info:   &existingObj,
+	}
+
+	return o, o.Update(ctx, in, src, options...)
 }
 
 // Rmdir implements fs.Fs.
 func (f *Fs) Rmdir(ctx context.Context, dir string) error {
-	// TODO: .
-	return fmt.Errorf("unimplemented")
+	dir = f.ParsePath(dir)
+
+	// TODO: Test this
+	n := (*f.srv).GetNodeByPath(dir)
+	if n.Swigcptr() == 0 {
+		return fmt.Errorf("folder not found")
+	}
+
+	if !n.IsFolder() {
+		return fmt.Errorf("the path isn't a folder")
+	}
+
+	if c := n.GetChildren(); c.Swigcptr() != 0 || c.Size() > 0 {
+		return fmt.Errorf("folder not empty")
+	}
+
+	listenerObj := MyMegaListener{}
+	listenerObj.cv = sync.NewCond(&listenerObj.m)
+	listener := mega.NewDirectorMegaRequestListener(&listenerObj)
+
+	(*f.srv).Remove(n, listener)
+	listenerObj.Wait()
+	defer listenerObj.Reset()
+
+	if (*listenerObj.GetError()).GetErrorCode() != mega.MegaErrorAPI_OK {
+		return fmt.Errorf("error deleting folder")
+	}
+
+	fs.Debugf(f, "Folder deleted OK")
+	return nil
 }
 
 // ------------------------------------------------------------
 
 // ModTime implements fs.DirEntry.
 func (o *Object) ModTime(context.Context) time.Time {
-	return intToTime((*o.info).GetModificationTime())
+	if o.info != nil {
+		return intToTime((*o.info).GetModificationTime())
+	}
+	return time.Unix(0, 0)
 }
 
 // Remote implements fs.DirEntry.
@@ -362,8 +448,10 @@ func (o *Object) Remote() string {
 
 // Size implements fs.DirEntry.
 func (o *Object) Size() int64 {
-	// TODO: Does this fail for folders?
-	return (*o.info).GetSize()
+	if o.info != nil {
+		return (*o.info).GetSize()
+	}
+	return 0
 }
 
 // String implements fs.DirEntry.
@@ -395,11 +483,11 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 // Remove implements fs.Object.
 func (o *Object) Remove(ctx context.Context) error {
 	// TODO: Test this
-	_n := o.info
-	if _n == nil {
+	if o.info == nil {
 		return fmt.Errorf("file not found")
 	}
-	n := *_n
+
+	n := *o.info
 
 	if !n.IsFile() {
 		return fmt.Errorf("the path isn't a file")
@@ -423,8 +511,7 @@ func (o *Object) Remove(ctx context.Context) error {
 
 // SetModTime implements fs.Object.
 func (o *Object) SetModTime(ctx context.Context, t time.Time) error {
-	// TODO: .
-	return fmt.Errorf("unimplemented")
+	return fs.ErrorCantSetModTime
 }
 
 // Storable implements fs.Object.
@@ -436,6 +523,7 @@ func (o *Object) Storable() bool {
 // Update implements fs.Object.
 func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) error {
 	// TODO: .
+	fmt.Printf("what\n")
 	return fmt.Errorf("unimplemented")
 }
 
@@ -447,20 +535,94 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 // deleting all the files quicker than just running Remove() on the
 // result of List()
 func (f *Fs) Purge(ctx context.Context, dir string) error {
-	// TODO: .
-	return fmt.Errorf("unimplemented")
+	return fs.ErrorCantPurge
 }
 
 func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object, error) {
+	dstFs := f
+
+	//log.Printf("Move %q -> %q", src.Remote(), remote)
+	srcObj, ok := src.(*Object)
+	if !ok {
+		fs.Debugf(src, "Can't move - not same remote type")
+		return nil, fs.ErrorCantMove
+	}
+
+	//source := (*f.srv).GetNodeByHandle()
 	// TODO: .
-	dstObj := &Object{}
+
+	dstObj := &Object{
+		fs:     dstFs,
+		remote: remote,
+		info:   srcObj.info,
+	}
+
 	return dstObj, fmt.Errorf("unimplemented")
 }
 
+/*
+2023/10/02 13:50:04 DEBUG : notes.txt: Need to transfer - File not found at Destination
+2023/10/02 13:50:04 ERROR : notes.txt: corrupted on transfer: sizes differ 1497 vs 0
+2023/10/02 13:50:04 INFO  : notes.txt: Removing failed copy
+2023/10/02 13:50:04 INFO  : notes.txt: Failed to remove failed copy: file not found
+2023/10/02 13:50:04 ERROR : Attempt 1/3 failed with 1 errors and: corrupted on transfer: sizes differ 1497 vs 0
+2023/10/02 13:50:04 DEBUG : notes.txt: Size and modification time the same (differ by -183.044725ms, within tolerance 1s)
+2023/10/02 13:50:04 DEBUG : notes.txt: Unchanged skipping
+2023/10/02 13:50:04 ERROR : Attempt 2/3 succeeded
+TODO: Why?
+*/
 func (f *Fs) PutUnchecked(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
-	// TODO: .
-	dstObj := &Object{}
-	return dstObj, fmt.Errorf("unimplemented")
+	dstObj := &Object{
+		fs:     f,
+		remote: src.Remote(),
+	}
+
+	dir := dstObj.FixPath()
+	node := (*f.srv).GetNodeByPath(dir)
+	if node.Swigcptr() != 0 {
+		return dstObj, fmt.Errorf("file exists")
+	}
+
+	index := strings.LastIndex(dir, "/")
+	parentDir := dir[:index+1]
+	fileName := dir[index+1:]
+	pnode := (*f.srv).GetNodeByPath(parentDir)
+	if node.Swigcptr() != 0 {
+		return dstObj, fmt.Errorf("failed to find parent folder")
+	}
+
+	// Create a temporary file
+	tempFile, err := os.CreateTemp("", "mega*.tmp")
+	if err != nil {
+		return dstObj, fmt.Errorf("failed to create temporary file")
+	}
+
+	_, err = io.Copy(tempFile, in)
+	if err != nil {
+		return dstObj, fmt.Errorf("failed to write temporary file")
+	}
+
+	listenerObj := MyMegaTransferListener{}
+	listenerObj.cv = sync.NewCond(&listenerObj.m)
+	listener := mega.NewDirectorMegaTransferListener(&listenerObj)
+
+	token := mega.MegaCancelTokenCreateInstance()
+
+	(*f.srv).StartUpload(
+		tempFile.Name(),         //Localpath
+		pnode,                   //Directory
+		fileName,                //Filename
+		src.ModTime(ctx).Unix(), //Modification time
+		"",                      // Temporary directory
+		true,                    // Temporary source
+		false,                   // Priority
+		token,                   // Cancel token
+		listener,                //Listener
+	)
+	listenerObj.Wait()
+	defer listenerObj.Reset()
+
+	return dstObj, nil
 }
 
 func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string) error {
