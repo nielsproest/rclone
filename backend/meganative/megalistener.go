@@ -8,7 +8,6 @@ import (
 
 type MyMegaListener struct {
 	mega.SwigDirector_MegaListener
-	director *mega.MegaListener
 	notified bool
 	err      *mega.MegaError
 	request  *mega.MegaRequest

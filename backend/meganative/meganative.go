@@ -20,7 +20,6 @@ import (
 	"github.com/rclone/rclone/fs/config/obscure"
 	"github.com/rclone/rclone/fs/hash"
 	"github.com/rclone/rclone/lib/encoder"
-	"github.com/rclone/rclone/lib/pacer"
 )
 
 // STRONG WARNING:
@@ -41,6 +40,16 @@ import (
  * TODO: Find out about the state files that are generated
  */
 
+/*
+ * The path separator character is '/'
+ * The Root node is /
+ * The Vault root node is //in/
+ * The Rubbish root node is //bin/
+ *
+ * Paths with names containing '/', '\' or ':' aren't compatible
+ * with this function.
+ */
+
 const (
 	minSleep      = 10 * time.Millisecond
 	maxSleep      = 2 * time.Second
@@ -50,12 +59,12 @@ const (
 
 // Options defines the configuration for this backend
 type Options struct {
-	User     string               `config:"user"`
-	Pass     string               `config:"pass"`
-	Debug    bool                 `config:"debug"`
-	UseHTTPS bool                 `config:"use_https"`
-	Enc      encoder.MultiEncoder `config:"encoding"`
-	// TODO: Hard-delete and the rest
+	User       string               `config:"user"`
+	Pass       string               `config:"pass"`
+	Debug      bool                 `config:"debug"`
+	HardDelete bool                 `config:"hard_delete"`
+	UseHTTPS   bool                 `config:"use_https"`
+	Enc        encoder.MultiEncoder `config:"encoding"`
 }
 
 // Fs represents a remote mega
@@ -66,7 +75,6 @@ type Fs struct {
 	features  *fs.Features  // optional features
 	srv       *mega.MegaApi // the connection to the server
 	srvListen *MyMegaListener
-	pacer     *fs.Pacer // pacer for API calls
 }
 
 // Object describes a mega object
@@ -84,6 +92,7 @@ type Object struct {
 
 // ID implements fs.IDer.
 func (o *Object) ID() string {
+	// TODO: Use handle?
 	return (*o.info).GetBase64Key()
 }
 
@@ -137,6 +146,15 @@ information from the mega backend.`,
 			Default:  false,
 			Advanced: true,
 		}, {
+			Name: "hard_delete",
+			Help: `Delete files permanently rather than putting them into the trash.
+
+Normally the mega backend will put all deletions into the trash rather
+than permanently deleting them.  If you specify this then rclone will
+permanently delete objects instead.`,
+			Default:  false,
+			Advanced: true,
+		}, {
 			Name: "use_https",
 			Help: `Use HTTPS for transfers.
 
@@ -173,12 +191,11 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 			return nil, fmt.Errorf("couldn't decrypt password: %w", err)
 		}
 	}
+
 	// Used for api calls, not transfers
 	listenerObj := MyMegaListener{}
 	listenerObj.cv = sync.NewCond(&listenerObj.m)
 	director := mega.NewDirectorMegaListener(&listenerObj)
-	// TODO: Do i need this reference?
-	listenerObj.director = &director
 
 	// TODO: Generate code at: https://mega.co.nz/#sdk
 	srv := mega.NewMegaApi("ht1gUZLZ", "", "MEGA/SDK Rclone filesystem")
@@ -208,7 +225,6 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		opt:       *opt,
 		srv:       &srv,
 		srvListen: &listenerObj,
-		pacer:     fs.NewPacer(ctx, pacer.NewDefault(pacer.MinSleep(minSleep), pacer.MaxSleep(maxSleep), pacer.DecayConstant(decayConstant))),
 	}
 	f.features = (&fs.Features{
 		DuplicateFiles:          true,
@@ -243,23 +259,20 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 // ------------------------------------------------------------
 
 // parsePath parses a mega 'url'
-// With mega-sdk, the root is ALWAYS /
 func parsePath(path string) (root string) {
-	root = path
-	if !strings.HasPrefix(root, "/") {
-		root = "/" + root
-	}
+	root = strings.Trim(path, "/")
 	return
 }
 
+// With mega-sdk, the root is ALWAYS /
 func (f *Fs) ParsePath(dir string) string {
 	dir = strings.TrimSuffix(dir, "/")
 
-	if f.root == "/" {
-		return fmt.Sprintf("%s%s", f.root, dir)
+	if !strings.HasPrefix(dir, "/") {
+		dir = "/" + dir
 	}
 
-	return fmt.Sprintf("%s/%s", f.root, dir)
+	return dir
 }
 
 // Converts any mega unix time to time.Time
@@ -269,6 +282,7 @@ func intToTime(num int64) time.Time {
 
 // Creates a unique id for each node
 func nodeToUnique(node *mega.MegaNode) string {
+	// TODO: Use base64 handle operations
 	return strconv.FormatInt((*node).GetHandle(), 10)
 }
 
@@ -281,18 +295,38 @@ func (o *Object) FixPath() string {
 	return o.fs.ParsePath(o.remote)
 }
 
+// findDir finds the directory rooted from the node passed in
+func (f *Fs) findDir(dir string) (*mega.MegaNode, error) {
+	n := (*f.srv).GetNodeByPath(f.ParsePath(dir))
+	if n.Swigcptr() == 0 {
+		return nil, fs.ErrorDirNotFound
+	} else if n.Swigcptr() != 0 && n.GetType() == mega.MegaNodeTYPE_FILE {
+		return nil, fs.ErrorIsFile
+	}
+	return &n, nil
+}
+
+// findObject looks up the node for the object of the name given
+func (f *Fs) findObject(file string) (*mega.MegaNode, error) {
+	n := (*f.srv).GetNodeByPath(f.ParsePath(file))
+	if n.Swigcptr() == 0 {
+		return nil, fs.ErrorObjectNotFound
+	} else if n.Swigcptr() != 0 && n.GetType() != mega.MegaNodeTYPE_FILE {
+		return nil, fs.ErrorIsDir
+	}
+	return &n, nil
+}
+
 // ------------------------------------------------------------
 
 // List implements fs.Fs.
 func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err error) {
-	dir = parsePath(dir)
-
-	dirNode := (*f.srv).GetNodeByPath(dir)
-	if dirNode.Swigcptr() == 0 {
-		return nil, fmt.Errorf("couldn't find path")
+	dirNode, err := f.findDir(dir)
+	if err != nil {
+		return nil, err
 	}
 
-	children := (*f.srv).GetChildren(dirNode)
+	children := (*f.srv).GetChildren(*dirNode)
 	if children.Swigcptr() == 0 {
 		return nil, fmt.Errorf("couldn't list files")
 	}
@@ -308,7 +342,7 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 		switch node.GetType() {
 		case mega.MegaNodeTYPE_FOLDER:
 			modTime := intToTime(node.GetModificationTime())
-			d := fs.NewDir(remote, modTime).SetID(nodeToUnique(&node)).SetParentID(nodeToUnique(&dirNode))
+			d := fs.NewDir(remote, modTime).SetID(nodeToUnique(&node)).SetParentID(nodeToUnique(dirNode))
 			entries = append(entries, d)
 		case mega.MegaNodeTYPE_FILE:
 			o := &Object{
@@ -326,26 +360,24 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 
 // Mkdir implements fs.Fs.
 func (f *Fs) Mkdir(ctx context.Context, dir string) error {
-	dir = f.ParsePath(dir)
-
-	n := (*f.srv).GetNodeByPath(dir)
-	if n.Swigcptr() != 0 {
-		return fmt.Errorf("path already exists")
+	_, err := f.findDir(dir)
+	if err == nil {
+		return fmt.Errorf("Mkdir failed: %w", err)
 	}
 
 	index := strings.LastIndex(dir, "/")
 	parentDir := dir[:index+1]
 	fileName := dir[index+1:]
-	n = (*f.srv).GetNodeByPath(parentDir)
-	if n.Swigcptr() == 0 || n.IsFile() {
-		return fmt.Errorf("parent folder not found")
+	n, err := f.findDir(parentDir)
+	if err != nil || (*n).IsFile() {
+		return err
 	}
 
 	listenerObj := MyMegaListener{}
 	listenerObj.cv = sync.NewCond(&listenerObj.m)
 	listener := mega.NewDirectorMegaRequestListener(&listenerObj)
 
-	(*f.srv).CreateFolder(fileName, n, listener)
+	(*f.srv).CreateFolder(fileName, *n, listener)
 	listenerObj.Wait()
 	defer listenerObj.Reset()
 
@@ -364,6 +396,7 @@ func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 		remote: remote,
 	}
 
+	fmt.Printf("TEST5: %s\n", o.FixPath())
 	n := (*f.srv).GetNodeByPath(o.FixPath())
 	if n.Swigcptr() == 0 {
 		return o, fs.ErrorObjectNotFound
@@ -383,15 +416,15 @@ func (f *Fs) Precision() time.Duration {
 
 // Put implements fs.Fs.
 func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
-	existingObj := (*f.srv).GetNodeByPath(f.ParsePath(src.Remote()))
-	if existingObj.Swigcptr() == 0 {
+	existingObj, err := f.findObject(src.Remote())
+	if err != nil {
 		return f.PutUnchecked(ctx, in, src)
 	}
 
 	o := &Object{
 		fs:     f,
 		remote: src.Remote(),
-		info:   &existingObj,
+		info:   existingObj,
 	}
 
 	return o, o.Update(ctx, in, src, options...)
@@ -399,19 +432,18 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options .
 
 // Rmdir implements fs.Fs.
 func (f *Fs) Rmdir(ctx context.Context, dir string) error {
-	dir = f.ParsePath(dir)
-
 	// TODO: Test this
-	n := (*f.srv).GetNodeByPath(dir)
-	if n.Swigcptr() == 0 {
-		return fmt.Errorf("folder not found")
+	n, err := f.findDir(dir)
+	fmt.Printf("PATH2: %s\n", dir)
+	if err != nil {
+		return err
 	}
 
-	if !n.IsFolder() {
+	if !(*n).IsFolder() {
 		return fmt.Errorf("the path isn't a folder")
 	}
 
-	if c := n.GetChildren(); c.Swigcptr() != 0 || c.Size() > 0 {
+	if c := (*n).GetChildren(); c.Swigcptr() != 0 || c.Size() > 0 {
 		return fmt.Errorf("folder not empty")
 	}
 
@@ -419,9 +451,14 @@ func (f *Fs) Rmdir(ctx context.Context, dir string) error {
 	listenerObj.cv = sync.NewCond(&listenerObj.m)
 	listener := mega.NewDirectorMegaRequestListener(&listenerObj)
 
-	(*f.srv).Remove(n, listener)
-	listenerObj.Wait()
-	defer listenerObj.Reset()
+	// TODO: Harddelete
+	if f.opt.HardDelete {
+		(*f.srv).Remove(*n, listener)
+		listenerObj.Wait()
+		defer listenerObj.Reset()
+	} else {
+		(*f.srv).MoveNode(*n, (*f.srv).GetRubbishNode())
+	}
 
 	if (*listenerObj.GetError()).GetErrorCode() != mega.MegaErrorAPI_OK {
 		return fmt.Errorf("error deleting folder")
@@ -471,7 +508,7 @@ func (o *Object) Fs() fs.Info {
 
 // Hash implements fs.Object.
 func (o *Object) Hash(ctx context.Context, ty hash.Type) (string, error) {
-	// Is reportedly a: Base64-encoded CRC of the node
+	// Is reportedly a: Base64-encoded CRC of the node contents
 	// But i cant figure it out
 	return (*o.fs.srv).GetCRC(*o.info), nil
 }
@@ -487,10 +524,13 @@ func (o *Object) Remove(ctx context.Context) error {
 	// TODO: Test this
 	// TODO: BROKEN
 	/*
-		2023/10/02 14:30:32 ERROR : Attempt 1/3 failed with 1 errors and: test:test.txt is a directory or doesn't exist: object not found
+		2023/10/02 16:27:17 DEBUG : fs cache: renaming cache item "test:test.txt" to be canonical "test:/test.txt"
+		2023/10/02 16:27:17 ERROR : Attempt 1/3 failed with 1 errors and: test:test.txt is a directory or doesn't exist: object not found
+		2023/10/02 16:27:17 ERROR : Attempt 2/3 failed with 1 errors and: test:test.txt is a directory or doesn't exist: object not found
+		2023/10/02 16:27:17 ERROR : Attempt 3/3 failed with 1 errors and: test:test.txt is a directory or doesn't exist: object not found
+		PATH3 isnt printed
 	*/
-	return fmt.Errorf("broken")
-
+	fmt.Printf("PATH3")
 	if o.info == nil {
 		return fmt.Errorf("file not found")
 	}
@@ -505,9 +545,13 @@ func (o *Object) Remove(ctx context.Context) error {
 	listenerObj.cv = sync.NewCond(&listenerObj.m)
 	listener := mega.NewDirectorMegaRequestListener(&listenerObj)
 
-	(*o.fs.srv).Remove(n, listener)
-	listenerObj.Wait()
-	defer listenerObj.Reset()
+	if o.fs.opt.HardDelete {
+		(*o.fs.srv).Remove(n, listener)
+		listenerObj.Wait()
+		defer listenerObj.Reset()
+	} else {
+		(*o.fs.srv).MoveNode(n, (*o.fs.srv).GetRubbishNode())
+	}
 
 	if (*listenerObj.GetError()).GetErrorCode() != mega.MegaErrorAPI_OK {
 		return fmt.Errorf("error deleting file")
@@ -531,7 +575,6 @@ func (o *Object) SetModTime(ctx context.Context, t time.Time) error {
 
 // Storable implements fs.Object.
 func (o *Object) Storable() bool {
-	// TODO: .
 	return true
 }
 
@@ -569,17 +612,17 @@ func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object,
 }
 
 func (f *Fs) write(ctx context.Context, dstObj *Object, in io.Reader, src fs.ObjectInfo, ignore_exist bool) (*Object, error) {
-	dir := dstObj.FixPath()
-	node := (*f.srv).GetNodeByPath(dir)
-	if node.Swigcptr() != 0 && !ignore_exist {
-		return dstObj, fmt.Errorf("file exists")
+	_, err := f.findObject(dstObj.remote)
+	if err != nil && !ignore_exist {
+		return dstObj, err
 	}
 
+	dir := f.ParsePath(dstObj.remote)
 	index := strings.LastIndex(dir, "/")
 	parentDir := dir[:index+1]
 	fileName := dir[index+1:]
-	pnode := (*f.srv).GetNodeByPath(parentDir)
-	if node.Swigcptr() != 0 {
+	pnode, err := f.findObject(parentDir)
+	if err != nil {
 		return dstObj, fmt.Errorf("failed to find parent folder")
 	}
 
@@ -602,7 +645,7 @@ func (f *Fs) write(ctx context.Context, dstObj *Object, in io.Reader, src fs.Obj
 
 	(*f.srv).StartUpload(
 		tempFile.Name(),         //Localpath
-		pnode,                   //Directory
+		*pnode,                  //Directory
 		fileName,                //Filename
 		src.ModTime(ctx).Unix(), //Modification time
 		"",                      // Temporary directory
@@ -661,15 +704,22 @@ func (f *Fs) MergeDirs(ctx context.Context, dirs []fs.Directory) error {
 
 // PublicLink implements fs.PublicLinker.
 func (f *Fs) PublicLink(ctx context.Context, remote string, expire fs.Duration, unlink bool) (string, error) {
-	// TODO: .
-	return "", fmt.Errorf("unimplemented")
+	node := (*f.srv).GetNodeByPath(f.ParsePath(remote))
+	if node.Swigcptr() == 0 {
+		return "", fmt.Errorf("object not found")
+	}
+
+	var err error
+	link := node.GetPublicLink(true)
+	if link == "" {
+		err = fmt.Errorf("non-exported file")
+	}
+
+	return link, err
 }
 
 // DirCacheFlush implements fs.DirCacheFlusher.
-func (f *Fs) DirCacheFlush() {
-	// (*f.srv).Catchup()
-	// TODO: Should i wait for this?
-}
+func (f *Fs) DirCacheFlush() {}
 
 // Check the interfaces are satisfied
 var (
