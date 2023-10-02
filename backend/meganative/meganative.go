@@ -6,7 +6,6 @@ import (
 	"io"
 	"os"
 	"path"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -92,8 +91,7 @@ type Object struct {
 
 // ID implements fs.IDer.
 func (o *Object) ID() string {
-	// TODO: Use handle?
-	return (*o.info).GetBase64Key()
+	return (*o.info).GetBase64Handle()
 }
 
 // Name of the remote (as passed into NewFs)
@@ -118,6 +116,7 @@ func (f *Fs) Features() *fs.Features {
 
 // Hashes returns the supported hash sets.
 func (f *Fs) Hashes() hash.Set {
+	// TODO: Mega supports CRC, but im unsure of the format
 	return hash.Set(hash.None)
 }
 
@@ -280,17 +279,7 @@ func intToTime(num int64) time.Time {
 	return time.Unix(num, 0)
 }
 
-// Creates a unique id for each node
-func nodeToUnique(node *mega.MegaNode) string {
-	// TODO: Use base64 handle operations
-	return strconv.FormatInt((*node).GetHandle(), 10)
-}
-
 // Parses the unique id
-func (o *Object) Unique() int64 {
-	val, _ := strconv.ParseInt(o.ID(), 10, 64)
-	return val
-}
 func (o *Object) FixPath() string {
 	return o.fs.ParsePath(o.remote)
 }
@@ -342,7 +331,7 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 		switch node.GetType() {
 		case mega.MegaNodeTYPE_FOLDER:
 			modTime := intToTime(node.GetModificationTime())
-			d := fs.NewDir(remote, modTime).SetID(nodeToUnique(&node)).SetParentID(nodeToUnique(dirNode))
+			d := fs.NewDir(remote, modTime).SetID(node.GetBase64Handle()).SetParentID((*dirNode).GetBase64Handle())
 			entries = append(entries, d)
 		case mega.MegaNodeTYPE_FILE:
 			o := &Object{
@@ -397,16 +386,12 @@ func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 	}
 
 	fmt.Printf("TEST5: %s\n", o.FixPath())
-	n := (*f.srv).GetNodeByPath(o.FixPath())
-	if n.Swigcptr() == 0 {
-		return o, fs.ErrorObjectNotFound
-	}
-	if !n.IsFile() {
-		return o, fs.ErrorIsDir
+	n, err := f.findObject(remote)
+	if err == nil {
+		o.info = n
 	}
 
-	o.info = &n
-	return o, nil
+	return o, err
 }
 
 // Precision implements fs.Fs.
@@ -451,7 +436,6 @@ func (f *Fs) Rmdir(ctx context.Context, dir string) error {
 	listenerObj.cv = sync.NewCond(&listenerObj.m)
 	listener := mega.NewDirectorMegaRequestListener(&listenerObj)
 
-	// TODO: Harddelete
 	if f.opt.HardDelete {
 		(*f.srv).Remove(*n, listener)
 		listenerObj.Wait()
@@ -472,6 +456,7 @@ func (f *Fs) Rmdir(ctx context.Context, dir string) error {
 
 // ModTime implements fs.DirEntry.
 func (o *Object) ModTime(context.Context) time.Time {
+	fmt.Printf("test2\n")
 	if o.info != nil {
 		return intToTime((*o.info).GetModificationTime())
 	}
@@ -485,6 +470,7 @@ func (o *Object) Remote() string {
 
 // Size implements fs.DirEntry.
 func (o *Object) Size() int64 {
+	fmt.Printf("test1\n")
 	if o.info != nil {
 		return (*o.info).GetSize()
 	}
@@ -508,7 +494,7 @@ func (o *Object) Fs() fs.Info {
 
 // Hash implements fs.Object.
 func (o *Object) Hash(ctx context.Context, ty hash.Type) (string, error) {
-	// Is reportedly a: Base64-encoded CRC of the node contents
+	// Is reportedly a: "Base64-encoded CRC of the file. The CRC of a file is a hash of its contents"
 	// But i cant figure it out
 	return (*o.fs.srv).GetCRC(*o.info), nil
 }
@@ -612,7 +598,7 @@ func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object,
 }
 
 func (f *Fs) write(ctx context.Context, dstObj *Object, in io.Reader, src fs.ObjectInfo, ignore_exist bool) (*Object, error) {
-	_, err := f.findObject(dstObj.remote)
+	node, err := f.findObject(dstObj.remote)
 	if err != nil && !ignore_exist {
 		return dstObj, err
 	}
@@ -656,6 +642,17 @@ func (f *Fs) write(ctx context.Context, dstObj *Object, in io.Reader, src fs.Obj
 	)
 	listenerObj.Wait()
 	defer listenerObj.Reset()
+
+	// Delete old node
+	if node != nil {
+		listenerObj := MyMegaListener{}
+		listenerObj.cv = sync.NewCond(&listenerObj.m)
+		listener := mega.NewDirectorMegaRequestListener(&listenerObj)
+
+		(*f.srv).Remove(*node, listener)
+		listenerObj.Wait()
+		defer listenerObj.Reset()
+	}
 
 	return dstObj, nil
 }
