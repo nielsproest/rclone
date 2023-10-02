@@ -306,6 +306,22 @@ func (f *Fs) findObject(file string) (*mega.MegaNode, error) {
 	return &n, nil
 }
 
+func (f *Fs) hardDelete(node mega.MegaNode) error {
+	listenerObj := MyMegaListener{}
+	listenerObj.cv = sync.NewCond(&listenerObj.m)
+	listener := mega.NewDirectorMegaRequestListener(&listenerObj)
+
+	(*f.srv).Remove(node, listener)
+	listenerObj.Wait()
+	defer listenerObj.Reset()
+
+	if (*listenerObj.GetError()).GetErrorCode() != mega.MegaErrorAPI_OK {
+		return fmt.Errorf("error deleting folder")
+	}
+
+	return nil
+}
+
 // ------------------------------------------------------------
 
 // List implements fs.Fs.
@@ -432,20 +448,13 @@ func (f *Fs) Rmdir(ctx context.Context, dir string) error {
 		return fmt.Errorf("folder not empty")
 	}
 
-	listenerObj := MyMegaListener{}
-	listenerObj.cv = sync.NewCond(&listenerObj.m)
-	listener := mega.NewDirectorMegaRequestListener(&listenerObj)
-
 	if f.opt.HardDelete {
-		(*f.srv).Remove(*n, listener)
-		listenerObj.Wait()
-		defer listenerObj.Reset()
+		if err := f.hardDelete(*n); err != nil {
+			return err
+		}
 	} else {
+		// TODO: Is this correct?
 		(*f.srv).MoveNode(*n, (*f.srv).GetRubbishNode())
-	}
-
-	if (*listenerObj.GetError()).GetErrorCode() != mega.MegaErrorAPI_OK {
-		return fmt.Errorf("error deleting folder")
 	}
 
 	fs.Debugf(f, "Folder deleted OK")
@@ -527,20 +536,13 @@ func (o *Object) Remove(ctx context.Context) error {
 		return fmt.Errorf("the path isn't a file")
 	}
 
-	listenerObj := MyMegaListener{}
-	listenerObj.cv = sync.NewCond(&listenerObj.m)
-	listener := mega.NewDirectorMegaRequestListener(&listenerObj)
-
 	if o.fs.opt.HardDelete {
-		(*o.fs.srv).Remove(n, listener)
-		listenerObj.Wait()
-		defer listenerObj.Reset()
+		if err := o.fs.hardDelete(n); err != nil {
+			return err
+		}
 	} else {
+		// TODO: Is this correct?
 		(*o.fs.srv).MoveNode(n, (*o.fs.srv).GetRubbishNode())
-	}
-
-	if (*listenerObj.GetError()).GetErrorCode() != mega.MegaErrorAPI_OK {
-		return fmt.Errorf("error deleting file")
 	}
 
 	fs.Debugf(o.fs, "File deleted OK")
@@ -644,17 +646,12 @@ func (f *Fs) write(ctx context.Context, dstObj *Object, in io.Reader, src fs.Obj
 	defer listenerObj.Reset()
 
 	// Delete old node
+	err = nil
 	if node != nil {
-		listenerObj := MyMegaListener{}
-		listenerObj.cv = sync.NewCond(&listenerObj.m)
-		listener := mega.NewDirectorMegaRequestListener(&listenerObj)
-
-		(*f.srv).Remove(*node, listener)
-		listenerObj.Wait()
-		defer listenerObj.Reset()
+		err = f.hardDelete(*node)
 	}
 
-	return dstObj, nil
+	return dstObj, err
 }
 
 func (f *Fs) PutUnchecked(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
