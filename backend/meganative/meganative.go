@@ -173,7 +173,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	// Used for api calls, not transfers
 	listenerObj := MyMegaListener{}
 	listenerObj.cv = sync.NewCond(&listenerObj.m)
-	listener := mega.NewDirectorMegaListener(&listenerObj)
+	listener := mega.NewDirectorMegaRequestListener(&listenerObj)
 
 	// TODO: Generate code at: https://mega.co.nz/#sdk
 	srv := mega.NewMegaApi(
@@ -181,7 +181,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		opt.Cache,                    // basePath
 		"MEGA/SDK Rclone filesystem", // userAgent
 		uint(opt.WorkerThreads))      // workerThreadCount
-	srv.AddListener(listener)
+	srv.AddRequestListener(listener)
 
 	// Use HTTPS
 	listenerObj.Reset()
@@ -388,7 +388,7 @@ func (f *Fs) mkdirParent(path string) (*mega.MegaNode, error) {
 }
 
 func (f *Fs) iterChildren(node mega.MegaNode) (<-chan mega.MegaNode, error) {
-	children := node.GetChildren()
+	children := f.API().GetChildren(node)
 	if children.Swigcptr() == 0 {
 		return nil, fs.ErrorListAborted
 	}
