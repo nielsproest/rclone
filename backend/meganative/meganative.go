@@ -682,16 +682,20 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 			}
 		}
 	}
+
+	// Bigger than file limit
 	if 0 > limit || limit+offset > (*o.info).GetSize() {
 		limit = (*o.info).GetSize() - offset
 	}
 
+	// Create listener
 	listenerObj := MyMegaTransferListener{}
 	listenerObj.cv = sync.NewCond(&listenerObj.m)
 	listener := mega.NewDirectorMegaTransferListener(&listenerObj)
 	listenerObj.director = &listener
 
-	reader := NewBufferedReaderCloser(1024)
+	// 1MB buffer
+	reader := NewBufferedReaderCloser(1024 * 1024)
 	listenerObj.out = reader
 	reader.obj = o
 	reader.listener = &listenerObj
