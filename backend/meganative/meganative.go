@@ -69,37 +69,6 @@ type Object struct {
 	info   *mega.MegaNode // pointer to the mega node
 }
 
-// ID implements fs.IDer.
-func (o *Object) ID() string {
-	return (*o.info).GetBase64Handle()
-}
-
-// Name of the remote (as passed into NewFs)
-func (f *Fs) Name() string {
-	return f.name
-}
-
-// Root of the remote (as passed into NewFs)
-func (f *Fs) Root() string {
-	return f.root
-}
-
-// String converts this Fs to a string
-func (f *Fs) String() string {
-	return fmt.Sprintf("mega root '%s'", f.root)
-}
-
-// Features returns the optional features of this Fs
-func (f *Fs) Features() *fs.Features {
-	return f.features
-}
-
-// Hashes returns the supported hash sets.
-func (f *Fs) Hashes() hash.Set {
-	// TODO: Mega supports CRC, but im unsure of the format
-	return hash.Set(hash.None)
-}
-
 // Register with Fs
 func init() {
 	fs.Register(&fs.RegInfo{
@@ -199,6 +168,12 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	srv.UseHttpsOnly(opt.UseHTTPS)
 	listenerObj.Wait()
 	listenerObj.Reset()
+
+	/* TODO:
+	srv.SetMaxConnections
+	srv.SetUploadLimit, setMaxUploadSpeed (DIFFERENCE?)
+	srv.SetDownloadLimit
+	*/
 
 	fs.Debugf("mega-native", "Trying log in...")
 	srv.Login(opt.User, opt.Pass)
@@ -319,6 +294,7 @@ func (f *Fs) moveNode(node mega.MegaNode, dir mega.MegaNode) error {
 	listener := mega.NewDirectorMegaRequestListener(&listenerObj)
 	defer mega.DeleteDirectorMegaRequestListener(listener)
 
+	// TODO: f.API().CheckMove(node, dir) is a thing?
 	f.API().MoveNode(node, dir, listener)
 	listenerObj.Wait()
 	defer listenerObj.Reset()
@@ -492,7 +468,6 @@ func (f *Fs) Precision() time.Duration {
 // Put implements fs.Fs.
 func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
 	fmt.Printf("HERE11\n")
-	// TODO: write literally does all of this, move this logic out of here
 	existingObj, err := f.findObject(src.Remote())
 	if err != nil {
 		return f.PutUnchecked(ctx, in, src)
@@ -510,7 +485,6 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options .
 // Rmdir implements fs.Fs.
 func (f *Fs) Rmdir(ctx context.Context, dir string) error {
 	fmt.Printf("PATH2: %s\n", dir)
-	// TODO: Test this
 	n, err := f.findDir(dir)
 	if err != nil {
 		return err
@@ -740,7 +714,6 @@ func (o *Object) Storable() bool {
 // result of List()
 func (f *Fs) Purge(ctx context.Context, dir string) error {
 	fmt.Printf("PATH71\n")
-	// TODO: Test this
 	n, err := f.findDir(dir)
 	if err != nil {
 		return err
@@ -985,7 +958,40 @@ func (f *Fs) PublicLink(ctx context.Context, remote string, expire fs.Duration, 
 }
 
 // DirCacheFlush implements fs.DirCacheFlusher.
-func (f *Fs) DirCacheFlush() {}
+func (f *Fs) DirCacheFlush() {
+	// TODO: Catchup?
+}
+
+// ID returns the ID of the Object if known, or "" if not
+func (o *Object) ID() string {
+	return (*o.info).GetBase64Handle()
+}
+
+// Name of the remote (as passed into NewFs)
+func (f *Fs) Name() string {
+	return f.name
+}
+
+// Root of the remote (as passed into NewFs)
+func (f *Fs) Root() string {
+	return f.root
+}
+
+// String converts this Fs to a string
+func (f *Fs) String() string {
+	return fmt.Sprintf("mega root '%s'", f.root)
+}
+
+// Features returns the optional features of this Fs
+func (f *Fs) Features() *fs.Features {
+	return f.features
+}
+
+// Hashes returns the supported hash sets.
+func (f *Fs) Hashes() hash.Set {
+	// TODO: Mega supports CRC, but im unsure of the format
+	return hash.Set(hash.None)
+}
 
 // Check the interfaces are satisfied
 var (
