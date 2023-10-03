@@ -1,6 +1,7 @@
 package meganative
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -19,6 +20,7 @@ import (
 	"github.com/rclone/rclone/fs/config/obscure"
 	"github.com/rclone/rclone/fs/hash"
 	"github.com/rclone/rclone/lib/encoder"
+	"github.com/rclone/rclone/lib/readers"
 )
 
 // STRONG WARNING:
@@ -510,10 +512,62 @@ func (o *Object) Hash(ctx context.Context, ty hash.Type) (string, error) {
 	return (*o.fs.srv).GetCRC(*o.info), nil
 }
 
+type openObject struct {
+	*readers.LimitedReadCloser
+	o      *Object
+	d      *MyMegaTransferListener
+	closed bool // Custom field to track if the reader is closed
+}
+
+// TODO: Do i need read, or will the builtin wait until chunks (it might not)
+// TODO: Folder/file mess bug
+
+// Close custom Close function
+func (lrc *openObject) Close() error {
+	if lrc.closed {
+		return nil // Already closed
+	}
+	(*lrc.o.fs.srv).CancelTransfer(*lrc.d.GetTransfer())
+	lrc.closed = true
+	return lrc.Closer.Close()
+}
+
 // Open implements fs.Object.
 func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadCloser, error) {
-	// TODO: .
-	return nil, fmt.Errorf("unimplemented")
+	// TODO: Test this (do we need io.SectionReader?)
+	var offset, limit int64 = 0, -1
+	for _, option := range options {
+		switch x := option.(type) {
+		case *fs.SeekOption:
+			offset = x.Offset
+		case *fs.RangeOption:
+			offset, limit = x.Decode(o.Size())
+		default:
+			if option.Mandatory() {
+				fs.Logf(o, "Unsupported mandatory option: %v", option)
+			}
+		}
+	}
+	if 0 > limit || limit+offset > (*o.info).GetSize() {
+		limit = (*o.info).GetSize() - offset
+	}
+
+	listenerObj := MyMegaTransferListener{}
+	listenerObj.cv = sync.NewCond(&listenerObj.m)
+	listener := mega.NewDirectorMegaTransferListener(&listenerObj)
+
+	buf := bytes.NewBufferString("")
+	listenerObj.out = buf
+
+	lrc := &openObject{
+		o: o,
+		d: &listenerObj,
+	}
+	lrc.R = buf
+
+	(*o.fs.srv).StartStreaming(*o.info, offset, limit, listener)
+
+	return readers.NewLimitedReadCloser(lrc, limit), nil
 }
 
 // Remove implements fs.Object.
@@ -607,7 +661,7 @@ func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object,
 	}
 
 	dest, err := f.findObject(remote)
-	if err != nil {
+	if err == nil {
 		fs.Debugf(f, "The destination is an existing file")
 		return nil, fs.ErrorCantMove
 	}
@@ -702,8 +756,9 @@ func (f *Fs) write(ctx context.Context, dstObj *Object, in io.Reader, src fs.Obj
 	listener := mega.NewDirectorMegaTransferListener(&listenerObj)
 
 	token := mega.MegaCancelTokenCreateInstance()
+	defer mega.DeleteMegaCancelToken(token)
 
-	// Somebody contact MEGA, ask them for a upload bytes interface :P
+	// Somebody contact MEGA, ask them for a upload chunks interface :P
 	(*f.srv).StartUpload(
 		tempFile.Name(),         //Localpath
 		*pnode,                  //Directory
@@ -738,7 +793,7 @@ func (f *Fs) PutUnchecked(ctx context.Context, in io.Reader, src fs.ObjectInfo, 
 
 func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string) error {
 	// TODO: .
-	return fmt.Errorf("unimplemented")
+	return fs.ErrorNotImplemented
 }
 
 // ------------------------------------------------------------
@@ -766,7 +821,7 @@ func (f *Fs) About(ctx context.Context) (*fs.Usage, error) {
 // MergeDirs implements fs.MergeDirser.
 func (f *Fs) MergeDirs(ctx context.Context, dirs []fs.Directory) error {
 	// TODO: .
-	return fmt.Errorf("unimplemented")
+	return fs.ErrorNotImplemented
 }
 
 // PublicLink implements fs.PublicLinker.
