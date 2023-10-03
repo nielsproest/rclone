@@ -710,15 +710,10 @@ func (f *Fs) Purge(ctx context.Context, dir string) error {
 // Will only be called if src.Fs().Name() == f.Name()
 //
 // If it isn't possible then return fs.ErrorCantMove
-func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object, error) {
-	fmt.Printf("HERE12\n")
-	dstFs := f
-
-	fs.Debugf(f, "Move %q -> %q", src.Remote(), remote)
-	srcObj, ok := src.(*Object)
-	if !ok {
-		fs.Debugf(f, "Can't move - not same remote type")
-		return nil, fs.ErrorCantMove
+func (f *Fs) move(source string, remote string) (*mega.MegaNode, error) {
+	srcNode, err := f.findObject(source)
+	if err != nil {
+		return nil, err
 	}
 
 	dest, err := f.findObject(remote)
@@ -751,55 +746,45 @@ func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object,
 		}
 	}
 
-	srcPath, srcName := filepath.Split(f.parsePath(src.Remote()))
+	srcPath, srcName := filepath.Split(f.parsePath(source))
 	if srcPath != destPath {
-		if err := f.moveNode(*srcObj.info, *dest); err != nil {
-			return nil, fs.ErrorCantMove
+		if err := f.moveNode(*srcNode, *dest); err != nil {
+			return nil, err
 		}
 	}
 	if srcName != destName {
-		if err := f.renameNode(*srcObj.info, destName); err != nil {
-			return nil, fs.ErrorCantMove
+		if err := f.renameNode(*srcNode, destName); err != nil {
+			return nil, err
 		}
 	}
 
-	dstObj := &Object{
-		fs:     dstFs,
-		remote: remote,
-		info:   srcObj.info,
+	return srcNode, nil
+}
+
+func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object, error) {
+	fmt.Printf("HERE12\n")
+	fs.Debugf(f, "Move %q -> %q", src.Remote(), remote)
+	srcObj, ok := src.(*Object)
+	if !ok {
+		fs.Debugf(f, "Can't move - not same remote type")
+		return nil, fs.ErrorCantMove
 	}
 
-	return dstObj, nil
+	srcNode, err := f.move(src.Remote(), remote)
+	if err != nil {
+		return nil, err
+	}
+
+	srcObj.remote = remote
+	// Shouldn't be necessary
+	srcObj.info = srcNode
+	return srcObj, nil
 }
 
 func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string) error {
-	dstFs := f
-	srcFs, ok := src.(*Fs)
-	if !ok {
-		fs.Debugf(srcFs, "Can't move directory - not same remote type")
-		return fs.ErrorCantDirMove
-	}
-
-	srcNode, err := f.findDir(srcRemote)
-	if err != nil {
-		return err
-	}
-
-	_, err = f.findDir(dstRemote)
-	if err == nil {
-		return fs.ErrorDirExists
-	}
-
-	dstPath, dstName := filepath.Split(dstRemote)
-	dstParentNode, err := f.findDir(dstPath)
-	if err != nil {
-		return err
-	}
-	if err := f.mkdir(dstName, *dstParentNode); err != nil {
-		return err
-	}
-
-	return fs.ErrorNotImplemented
+	// TODO: Default root creation breaks this
+	_, err := f.move(srcRemote, dstRemote)
+	return err
 }
 
 func (f *Fs) write(ctx context.Context, dstObj *Object, in io.Reader, src fs.ObjectInfo, ignore_exist bool) (*Object, error) {
