@@ -1,7 +1,6 @@
 package meganative
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -607,31 +606,69 @@ func (o *Object) Hash(ctx context.Context, ty hash.Type) (string, error) {
 	return o.fs.API().GetCRC(*o.info), nil
 }
 
-type openObject struct {
-	*readers.LimitedReadCloser
-	o      *Object
-	d      *MyMegaTransferListener
-	closed bool // Custom field to track if the reader is closed
+// BufferedReaderCloser is a custom type that implements io.ReaderCloser
+type BufferedReaderCloser struct {
+	buffer   []byte
+	bufferMu sync.Mutex
+	readCh   chan []byte
+	closeCh  chan struct{}
+	closed   bool
+	obj      *Object
+	listener *MyMegaTransferListener
 }
 
-// TODO: Do i need read, or will the builtin wait until chunks (it might not)
-// TODO: Folder/file mess bug
-
-// Close custom Close function
-func (lrc *openObject) Close() error {
-	if lrc.closed {
-		return nil // Already closed
+// NewBufferedReaderCloser creates a new BufferedReaderCloser with a specified buffer size.
+func NewBufferedReaderCloser(bufferSize int) *BufferedReaderCloser {
+	return &BufferedReaderCloser{
+		buffer:  make([]byte, bufferSize),
+		readCh:  make(chan []byte),
+		closeCh: make(chan struct{}),
+		closed:  false,
 	}
-	lrc.o.fs.API().CancelTransfer(*lrc.d.GetTransfer())
-	lrc.closed = true
-	return lrc.Closer.Close()
+}
+
+// Read reads data from the buffer.
+func (b *BufferedReaderCloser) Read(p []byte) (n int, err error) {
+	select {
+	case data := <-b.readCh:
+		n = copy(p, data)
+		return n, nil
+	case <-b.closeCh:
+		return 0, io.EOF
+	}
+}
+
+// Close closes the BufferedReaderCloser.
+func (b *BufferedReaderCloser) Close() error {
+	b.bufferMu.Lock()
+
+	// Ask Mega kindly to stop
+	b.obj.fs.API().CancelTransfer(*b.listener.GetTransfer())
+	defer mega.DeleteDirectorMegaTransferListener(*b.listener.director)
+
+	if !b.closed {
+		close(b.closeCh)
+		b.closed = true
+	}
+	b.bufferMu.Unlock()
+	return nil
+}
+
+// WriteToBuffer writes data to the buffer.
+func (b *BufferedReaderCloser) WriteToBuffer(data []byte) error {
+	b.bufferMu.Lock()
+	if b.closed {
+		b.bufferMu.Unlock()
+		return io.ErrClosedPipe
+	}
+	copy(b.buffer, data)
+	b.readCh <- b.buffer
+	b.bufferMu.Unlock()
+	return nil
 }
 
 // Open implements fs.Object.
 func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadCloser, error) {
-	return nil, fs.ErrorNotImplemented
-
-	// TODO: Test this (do we need io.SectionReader?)
 	var offset, limit int64 = 0, -1
 	for _, option := range options {
 		switch x := option.(type) {
@@ -652,44 +689,20 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 	listenerObj := MyMegaTransferListener{}
 	listenerObj.cv = sync.NewCond(&listenerObj.m)
 	listener := mega.NewDirectorMegaTransferListener(&listenerObj)
-	defer mega.DeleteDirectorMegaTransferListener(listener)
+	listenerObj.director = &listener
 
-	buf := bytes.NewBufferString("")
-	listenerObj.out = buf
-
-	/*
-		panic: runtime error: invalid memory address or nil pointer dereference
-		[signal SIGSEGV: segmentation violation code=0x1 addr=0x0 pc=0x1fe55b4]
-
-		goroutine 1 [running]:
-		github.com/rclone/rclone/backend/meganative.(*Object).Open(0xc00061ec20, {0x6?, 0x6?}, {0xc000adc870?, 0x1, 0x6?})
-				/mnt/newfiles/Work/rclone/backend/meganative/meganative.go:612 +0x3f4
-		github.com/rclone/rclone/fs/operations.(*ReOpen).open(0xc000a6b800)
-				/mnt/newfiles/Work/rclone/fs/operations/reopen.go:116 +0x523
-	*/
-
-	lrc := &openObject{
-		o: o,
-		d: &listenerObj,
-	}
-	lrc.R = buf
+	reader := NewBufferedReaderCloser(1024)
+	listenerObj.out = reader
+	reader.obj = o
+	reader.listener = &listenerObj
 
 	o.fs.API().StartStreaming(*o.info, offset, limit, listener)
 
-	return readers.NewLimitedReadCloser(lrc, limit), nil
+	return readers.NewLimitedReadCloser(reader, limit), nil
 }
 
 // Remove implements fs.Object.
 func (o *Object) Remove(ctx context.Context) error {
-	// TODO: Test this
-	// TODO: BROKEN (i think)
-	/*
-		2023/10/02 16:27:17 DEBUG : fs cache: renaming cache item "test:test.txt" to be canonical "test:/test.txt"
-		2023/10/02 16:27:17 ERROR : Attempt 1/3 failed with 1 errors and: test:test.txt is a directory or doesn't exist: object not found
-		2023/10/02 16:27:17 ERROR : Attempt 2/3 failed with 1 errors and: test:test.txt is a directory or doesn't exist: object not found
-		2023/10/02 16:27:17 ERROR : Attempt 3/3 failed with 1 errors and: test:test.txt is a directory or doesn't exist: object not found
-		PATH3 isnt printed
-	*/
 	fmt.Printf("PATH3")
 	if o.info == nil {
 		return fmt.Errorf("file not found")

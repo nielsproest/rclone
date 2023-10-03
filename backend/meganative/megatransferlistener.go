@@ -2,19 +2,23 @@ package meganative
 
 import (
 	"fmt"
-	"io"
 	mega "rclone/megasdk"
 	"sync"
 )
+
+type BufferWriter interface {
+	WriteToBuffer(data []byte) error
+}
 
 type MyMegaTransferListener struct {
 	mega.SwigDirector_MegaTransferListener
 	notified bool
 	err      *mega.MegaError
 	transfer *mega.MegaTransfer
+	director *mega.MegaTransferListener
 	m        sync.Mutex
 	cv       *sync.Cond
-	out      io.StringWriter
+	out      BufferWriter
 }
 
 func (l *MyMegaTransferListener) OnTransferFinish(api mega.MegaApi, transfer mega.MegaTransfer, e mega.MegaError) {
@@ -36,7 +40,8 @@ func (l *MyMegaTransferListener) OnTransferFinish(api mega.MegaApi, transfer meg
 }
 
 func (l *MyMegaTransferListener) OnTransferData(api mega.MegaApi, transfer mega.MegaTransfer, buffer string, size int64) bool {
-	l.out.WriteString(buffer)
+	buf := []byte(buffer)
+	l.out.WriteToBuffer(buf)
 	return true
 }
 
