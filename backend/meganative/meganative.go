@@ -247,6 +247,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	if rootNode.Swigcptr() == 0 {
 		return nil, fmt.Errorf("couldn't find root node")
 	}
+	// TODO: Rclone, Will future paths include the root, or do i need to add it?
 
 	// TODO: Create folder if missing (or dont?)
 	/*switch rootNode.GetType() {
@@ -338,7 +339,6 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 	for i := 0; i < children.Size(); i++ {
 		node := children.Get(i)
 		remote := path.Join(dir, f.opt.Enc.ToStandardName(node.GetName()))
-		fmt.Printf("dir %s\n", remote)
 		switch node.GetType() {
 		case mega.MegaNodeTYPE_FOLDER:
 			modTime := intToTime(node.GetModificationTime())
@@ -505,7 +505,7 @@ func (o *Object) Fs() fs.Info {
 
 // Hash implements fs.Object.
 func (o *Object) Hash(ctx context.Context, ty hash.Type) (string, error) {
-	// Is reportedly a: "Base64-encoded CRC of the file. The CRC of a file is a hash of its contents"
+	// TODO: Is reportedly a "Base64-encoded CRC of the file. The CRC of a file is a hash of its contents"
 	// But i cant figure it out
 	return (*o.fs.srv).GetCRC(*o.info), nil
 }
@@ -519,7 +519,7 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 // Remove implements fs.Object.
 func (o *Object) Remove(ctx context.Context) error {
 	// TODO: Test this
-	// TODO: BROKEN
+	// TODO: BROKEN (i think)
 	/*
 		2023/10/02 16:27:17 DEBUG : fs cache: renaming cache item "test:test.txt" to be canonical "test:/test.txt"
 		2023/10/02 16:27:17 ERROR : Attempt 1/3 failed with 1 errors and: test:test.txt is a directory or doesn't exist: object not found
@@ -580,19 +580,83 @@ func (f *Fs) Purge(ctx context.Context, dir string) error {
 	return fs.ErrorCantPurge
 }
 
+// Move src to this remote using server-side move operations.
+//
+// This is stored with the remote path given.
+//
+// It returns the destination Object and a possible error.
+//
+// Will only be called if src.Fs().Name() == f.Name()
+//
+// If it isn't possible then return fs.ErrorCantMove
 func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object, error) {
 	fmt.Printf("HERE12\n")
 	dstFs := f
 
-	//log.Printf("Move %q -> %q", src.Remote(), remote)
+	fs.Debugf(f, "Move %q -> %q", src.Remote(), remote)
 	srcObj, ok := src.(*Object)
 	if !ok {
-		fs.Debugf(src, "Can't move - not same remote type")
+		fs.Debugf(f, "Can't move - not same remote type")
 		return nil, fs.ErrorCantMove
 	}
 
-	//source := (*f.srv).GetNodeByHandle()
-	// TODO: .
+	source, err := f.findObject(srcObj.remote)
+	if err != nil {
+		fs.Debugf(f, "Source not found")
+		return nil, fs.ErrorObjectNotFound
+	}
+
+	dest, err := f.findObject(remote)
+	if err != nil {
+		fs.Debugf(f, "The destination is an existing file")
+		return nil, fs.ErrorCantMove
+	}
+
+	idx := strings.LastIndex(remote, "/")
+	destPath := remote[:idx]
+	dest, err = f.findDir(destPath)
+	if err != nil {
+		fs.Debugf(f, "Destination folder not found")
+		return nil, fs.ErrorCantMove
+	}
+
+	// TODO: Fails because root node doesnt exist
+	// We should keep the root to the dir of the folder
+	// and somehow fix that we need to keep the original root for move operations
+	// that will give "" otherwise, so we need root + remote at all times?
+	// TODO: DEBUG
+	return nil, fs.ErrorCantMove
+
+	// TODO: If move
+	if true {
+		listenerObj := MyMegaListener{}
+		listenerObj.cv = sync.NewCond(&listenerObj.m)
+		listener := mega.NewDirectorMegaRequestListener(&listenerObj)
+
+		(*f.srv).MoveNode(*source, *dest, &listener)
+		listenerObj.Wait()
+		defer listenerObj.Reset()
+
+		if (*listenerObj.GetError()).GetErrorCode() != mega.MegaErrorAPI_OK {
+			fs.Debugf(f, "Move failed")
+			return nil, fs.ErrorCantMove
+		}
+	}
+	// TODO: If rename
+	if false {
+		listenerObj := MyMegaListener{}
+		listenerObj.cv = sync.NewCond(&listenerObj.m)
+		listener := mega.NewDirectorMegaRequestListener(&listenerObj)
+
+		(*f.srv).RenameNode(*source, "test", &listener)
+		listenerObj.Wait()
+		defer listenerObj.Reset()
+
+		if (*listenerObj.GetError()).GetErrorCode() != mega.MegaErrorAPI_OK {
+			fs.Debugf(f, "Move failed")
+			return nil, fs.ErrorCantMove
+		}
+	}
 
 	dstObj := &Object{
 		fs:     dstFs,
