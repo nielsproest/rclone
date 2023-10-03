@@ -23,24 +23,6 @@ import (
 	"github.com/rclone/rclone/lib/readers"
 )
 
-// STRONG WARNING:
-// This is from SWIG bindings of a C++ project
-// There is insane amounts of pointer fuckery
-// The code below in almost no way resembles normal golang code
-// So for your safety, if you are dainty about golang code
-// Do not scroll further down
-
-/*
- * See megaapi.h for source documentation
- * Read MEGAdokan.cpp for a full fs driver, use this as main source, but also a little wrong download
- *
- * Read megacli.php for a full client, but with some wrong download/upload args
- * Read megafuse.cpp for nice c++ code
- * Read https://mega.io/developers
- *
- * TODO: Find out about the state files that are generated
- */
-
 /*
  * The path separator character is '/'
  * The Root node is /
@@ -51,19 +33,12 @@ import (
  * with this function.
  */
 
-const (
-	minSleep      = 10 * time.Millisecond
-	maxSleep      = 2 * time.Second
-	eventWaitTime = 500 * time.Millisecond
-	decayConstant = 2 // bigger for slower decay, exponential
-)
-
 // Options defines the configuration for this backend
 type Options struct {
 	User          string               `config:"user"`
 	Pass          string               `config:"pass"`
-	Cache         string               `config:"cache"`
 	Debug         bool                 `config:"debug"`
+	Cache         string               `config:"cache"`
 	HardDelete    bool                 `config:"hard_delete"`
 	UseHTTPS      bool                 `config:"use_https"`
 	WorkerThreads int                  `config:"worker_threads"`
@@ -72,9 +47,9 @@ type Options struct {
 
 // Fs represents a remote mega
 type Fs struct {
-	name      string          // name of this remote
-	root      string          // the path we are working on
-	_rootNode *mega.MegaNode  // root node
+	name      string // name of this remote
+	root      string // the path we are working on
+	_rootNode *mega.MegaNode
 	opt       Options         // parsed config options
 	features  *fs.Features    // optional features
 	srv       *mega.MegaApi   // the connection to the server
@@ -146,7 +121,7 @@ func init() {
 			Help: `MEGA State cache folder.
 
 Where to put MEGA state files.`,
-			Default:  "megacache",
+			Default:  "mega_cache",
 			Advanced: true,
 		}, {
 			Name: "debug",
@@ -256,9 +231,11 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	fs.Debugf("mega-native", "Retrieving root node...")
 	rootNode := f.API().GetNodeByPath(root)
 	if rootNode.Swigcptr() == 0 {
+		fs.Debugf("mega-native", "Couldn't find root node!")
 		return f, nil
 	}
 
+	f._rootNode = &rootNode
 	switch rootNode.GetType() {
 	case mega.MegaNodeTYPE_FOLDER:
 		// root node found and is a directory
@@ -277,11 +254,8 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 // ------------------------------------------------------------
 
 // parsePath parses a mega 'url'
-func (f *Fs) parsePath(path string) (root string) {
-	fmt.Printf("HERE10 %s\n", path)
-	root = filepath.Join("/", f.root, strings.Trim(path, "/"))
-	fmt.Printf("HERE10.1 %s\n", root)
-	return
+func (f *Fs) parsePath(path string) (string, mega.MegaNode) {
+	return strings.Trim(path, "/"), *f._rootNode
 }
 
 // Converts any mega unix time to time.Time
@@ -296,13 +270,16 @@ func (f *Fs) API() mega.MegaApi {
 
 // findDir finds the directory rooted from the node passed in
 func (f *Fs) findDir(dir string) (*mega.MegaNode, error) {
-	fmt.Printf("HERE7\n")
+	//fmt.Printf("HERE7 %s\n", f.parsePath(dir))
 	n := f.API().GetNodeByPath(f.parsePath(dir))
 	if n.Swigcptr() == 0 {
+		fmt.Printf("G1\n")
 		return nil, fs.ErrorDirNotFound
 	} else if n.Swigcptr() != 0 && n.GetType() == mega.MegaNodeTYPE_FILE {
+		fmt.Printf("G2\n")
 		return nil, fs.ErrorIsFile
 	}
+	fmt.Printf("G3\n")
 	return &n, nil
 }
 
@@ -374,23 +351,23 @@ func (f *Fs) renameNode(node mega.MegaNode, name string) error {
 
 // Make parent directory and return it
 func (f *Fs) mkdirParent(path string) (*mega.MegaNode, error) {
-	path = f.parsePath(path)
+	path, rootNode := f.parsePath(path)
 
 	// If parent dir exists
-	root, _ := filepath.Split(path)
-	rootNode := f.API().GetNodeByPath(root)
-	if rootNode.Swigcptr() != 0 {
-		return &rootNode, fs.ErrorDirExists
+	_root, _ := filepath.Split(path)
+	_rootNode := f.API().GetNodeByPath(_root, rootNode)
+	if _rootNode.Swigcptr() != 0 {
+		return &_rootNode, fs.ErrorDirExists
 	}
 
 	// If parent dir doesnt exist
-	rootParent, rootName := filepath.Split(root)
-	rootParentNode := f.API().GetNodeByPath(rootParent)
-	if rootParentNode.Swigcptr() != 0 {
+	_rootParent, _rootName := filepath.Split(_root)
+	_rootParentNode := f.API().GetNodeByPath(_rootParent, rootNode)
+	if _rootParentNode.Swigcptr() != 0 {
 		return nil, fs.ErrorDirNotFound
 	}
 
-	return f.mkdir(rootName, &rootParentNode)
+	return f.mkdir(_rootName, &_rootParentNode)
 }
 
 // Make directory and return it
@@ -430,25 +407,27 @@ func (f *Fs) mkdir(name string, parent *mega.MegaNode) (*mega.MegaNode, error) {
 
 // List implements fs.Fs.
 func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err error) {
-	fmt.Printf("HERE9\n")
-	_dirNode, err := f.findDir(dir)
+	fmt.Printf("HERE9 %s\n", dir)
+	dirNode, err := f.findDir(dir)
 	if err != nil {
+		fmt.Printf("J1\n")
 		return nil, err
 	}
-	dirNode := *_dirNode
 
-	children := f.API().GetChildren(dirNode)
+	children := f.API().GetChildren(*dirNode)
 	if children.Swigcptr() == 0 {
+		fmt.Printf("J2\n")
 		return nil, fmt.Errorf("couldn't list files")
 	}
 
+	fmt.Printf("M %d\n", children.Size())
 	for i := 0; i < children.Size(); i++ {
 		node := children.Get(i)
 		remote := path.Join(dir, f.opt.Enc.ToStandardName(node.GetName()))
 		switch node.GetType() {
 		case mega.MegaNodeTYPE_FOLDER:
 			modTime := intToTime(node.GetCreationTime())
-			d := fs.NewDir(remote, modTime).SetID(node.GetBase64Handle()).SetParentID(dirNode.GetBase64Handle())
+			d := fs.NewDir(remote, modTime).SetID(node.GetBase64Handle()).SetParentID((*dirNode).GetBase64Handle())
 			entries = append(entries, d)
 		case mega.MegaNodeTYPE_FILE:
 			o := &Object{
@@ -460,6 +439,7 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 			entries = append(entries, o)
 		}
 	}
+	fmt.Printf("J3\n")
 
 	return entries, nil
 }
@@ -540,9 +520,9 @@ func (f *Fs) Rmdir(ctx context.Context, dir string) error {
 		return fmt.Errorf("the path isn't a folder")
 	}
 
-	if c := (*n).GetChildren(); c.Swigcptr() != 0 || c.Size() > 0 {
+	/*if c := (*n).GetChildren(); c.Swigcptr() != 0 || c.Size() > 0 {
 		return fmt.Errorf("folder not empty")
-	}
+	}*/
 
 	if f.opt.HardDelete {
 		if err := f.hardDelete(*n); err != nil {
@@ -589,7 +569,8 @@ func (o *Object) String() string {
 	if o == nil {
 		return "<nil>"
 	}
-	return o.fs.parsePath(o.remote)
+	path, _ := o.fs.parsePath(o.remote)
+	return path
 }
 
 // ------------------------------------------------------------
@@ -758,7 +739,33 @@ func (o *Object) Storable() bool {
 // deleting all the files quicker than just running Remove() on the
 // result of List()
 func (f *Fs) Purge(ctx context.Context, dir string) error {
-	return fs.ErrorCantPurge
+	fmt.Printf("PATH71\n")
+	// TODO: Test this
+	n, err := f.findDir(dir)
+	if err != nil {
+		return err
+	}
+
+	if !(*n).IsFolder() {
+		return fmt.Errorf("the path isn't a folder")
+	}
+
+	/*if c := (*n).GetChildren(); c.Swigcptr() != 0 || c.Size() > 0 {
+		return fmt.Errorf("folder not empty")
+	}*/
+
+	if f.opt.HardDelete {
+		if err := f.hardDelete(*n); err != nil {
+			return err
+		}
+	} else {
+		if err := f.moveNode(*n, f.API().GetRubbishNode()); err != nil {
+			return err
+		}
+	}
+
+	fs.Debugf(f, "Folder purged OK")
+	return nil
 }
 
 // Move src to this remote using server-side move operations.
@@ -796,15 +803,17 @@ func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object,
 		return nil, err
 	}
 
-	srcPath, srcName := filepath.Split(f.parsePath(src.Remote()))
-	destPath, destName := filepath.Split(f.parsePath(remote))
-	if srcPath != destPath {
+	absSrc, _ := f.parsePath(src.Remote())
+	absDst, _ := f.parsePath(remote)
+	srcPath, srcName := filepath.Split(absSrc)
+	dstPath, dstName := filepath.Split(absDst)
+	if srcPath != dstPath {
 		if err := f.moveNode(*srcNode, *destNode); err != nil {
 			return nil, err
 		}
 	}
-	if srcName != destName {
-		if err := f.renameNode(*srcNode, destName); err != nil {
+	if srcName != dstName {
+		if err := f.renameNode(*srcNode, dstName); err != nil {
 			return nil, err
 		}
 	}
@@ -831,7 +840,9 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 		return fs.ErrorCantDirMove
 	}
 
-	fmt.Printf("DirMove: %s -> %s\n", srcFs.parsePath(srcRemote), dstFs.parsePath(dstRemote))
+	absSrc, _ := srcFs.parsePath(srcRemote)
+	absDst, _ := dstFs.parsePath(dstRemote)
+	fmt.Printf("DirMove: %s -> %s\n", absSrc, absDst)
 	srcNode, err := srcFs.findDir(srcRemote)
 	if err != nil {
 		return err
@@ -842,8 +853,8 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 		return err
 	}
 
-	srcPath, srcName := filepath.Split(srcFs.parsePath(srcRemote))
-	destPath, destName := filepath.Split(dstFs.parsePath(dstRemote))
+	srcPath, srcName := filepath.Split(absSrc)
+	destPath, destName := filepath.Split(absDst)
 	if srcPath != destPath {
 		if err := f.moveNode(*srcNode, *dstNode); err != nil {
 			return err
