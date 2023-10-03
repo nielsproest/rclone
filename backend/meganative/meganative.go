@@ -224,8 +224,9 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	fs.Debugf("mega-native", "Trying log in...")
 	srv.Login(opt.User, opt.Pass)
 	listenerObj.Wait()
-	if (*listenerObj.GetError()).GetErrorCode() != mega.MegaErrorAPI_OK {
-		return nil, fmt.Errorf("couldn't login: %w", err)
+	megaerr := *listenerObj.GetError()
+	if megaerr.GetErrorCode() != mega.MegaErrorAPI_OK {
+		return nil, fmt.Errorf("couldn't login: %s", megaerr.ToString())
 	}
 	listenerObj.Reset()
 
@@ -251,13 +252,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	fs.Debugf("mega-native", "Retrieving root node...")
 	rootNode := f.API().GetNodeByPath(root)
 	if rootNode.Swigcptr() == 0 {
-		// Create root
-		rootParent, rootName := filepath.Split(root)
-		rootParentNode := f.API().GetNodeByPath(rootParent)
-		if rootParentNode.Swigcptr() == 0 {
-			return nil, fs.ErrorDirNotFound
-		}
-		return f, f.mkdir(rootName, rootParentNode)
+		return f, nil
 	}
 
 	switch rootNode.GetType() {
@@ -329,8 +324,9 @@ func (f *Fs) hardDelete(node mega.MegaNode) error {
 	listenerObj.Wait()
 	defer listenerObj.Reset()
 
-	if (*listenerObj.GetError()).GetErrorCode() != mega.MegaErrorAPI_OK {
-		return fs.ErrorNotDeleting
+	megaerr := *listenerObj.GetError()
+	if megaerr.GetErrorCode() != mega.MegaErrorAPI_OK {
+		return fmt.Errorf("delete error: %s", megaerr.ToString())
 	}
 
 	return nil
@@ -346,8 +342,9 @@ func (f *Fs) moveNode(node mega.MegaNode, dir mega.MegaNode) error {
 	listenerObj.Wait()
 	defer listenerObj.Reset()
 
-	if (*listenerObj.GetError()).GetErrorCode() != mega.MegaErrorAPI_OK {
-		return fs.ErrorCantMove
+	megaerr := *listenerObj.GetError()
+	if megaerr.GetErrorCode() != mega.MegaErrorAPI_OK {
+		return fmt.Errorf("move error: %s", megaerr.ToString())
 	}
 
 	return nil
@@ -363,14 +360,37 @@ func (f *Fs) renameNode(node mega.MegaNode, name string) error {
 	listenerObj.Wait()
 	defer listenerObj.Reset()
 
-	if (*listenerObj.GetError()).GetErrorCode() != mega.MegaErrorAPI_OK {
-		return fs.ErrorCantMove
+	megaerr := *listenerObj.GetError()
+	if megaerr.GetErrorCode() != mega.MegaErrorAPI_OK {
+		return fmt.Errorf("rename error: %s", megaerr.ToString())
 	}
 
 	return nil
 }
 
-func (f *Fs) mkdir(name string, parent mega.MegaNode) error {
+// Make parent directory and return it
+func (f *Fs) mkdirParent(path string) (*mega.MegaNode, error) {
+	path = f.parsePath(path)
+
+	// If parent dir exists
+	root, _ := filepath.Split(path)
+	rootNode := f.API().GetNodeByPath(root)
+	if rootNode.Swigcptr() != 0 {
+		return &rootNode, fs.ErrorDirExists
+	}
+
+	// If parent dir doesnt exist
+	rootParent, rootName := filepath.Split(root)
+	rootParentNode := f.API().GetNodeByPath(rootParent)
+	if rootParentNode.Swigcptr() != 0 {
+		return nil, fs.ErrorDirNotFound
+	}
+
+	return f.mkdir(rootName, &rootParentNode)
+}
+
+// Make directory and return it
+func (f *Fs) mkdir(name string, parent *mega.MegaNode) (*mega.MegaNode, error) {
 	listenerObj := MyMegaListener{}
 	listenerObj.cv = sync.NewCond(&listenerObj.m)
 	listener := mega.NewDirectorMegaRequestListener(&listenerObj)
@@ -380,12 +400,24 @@ func (f *Fs) mkdir(name string, parent mega.MegaNode) error {
 	listenerObj.Wait()
 	defer listenerObj.Reset()
 
-	if (*listenerObj.GetError()).GetErrorCode() != mega.MegaErrorAPI_OK {
-		// Yeah i dont know what error to put here
-		return fs.ErrorCantDirMove
+	megaerr := *listenerObj.GetError()
+	if megaerr.GetErrorCode() != mega.MegaErrorAPI_OK {
+		return nil, fmt.Errorf("MEGA Mkdir Error: %s", megaerr.ToString())
 	}
 
-	return nil
+	children := (*parent).GetChildren()
+	if children.Swigcptr() == 0 {
+		return nil, fmt.Errorf("failed to find children of folder %s", name)
+	}
+
+	for i := 0; i < children.Size(); i++ {
+		node := children.Get(i)
+		if node.GetName() == name && node.GetType() == mega.MegaNodeTYPE_FOLDER {
+			return &node, nil
+		}
+	}
+
+	return nil, fmt.Errorf("created folder not found")
 }
 
 // ------------------------------------------------------------
@@ -440,7 +472,8 @@ func (f *Fs) Mkdir(ctx context.Context, dir string) error {
 		return err
 	}
 
-	return f.mkdir(srcName, *n)
+	_, err = f.mkdir(srcName, n)
+	return err
 }
 
 // NewObject implements fs.Fs.
@@ -710,8 +743,16 @@ func (f *Fs) Purge(ctx context.Context, dir string) error {
 // Will only be called if src.Fs().Name() == f.Name()
 //
 // If it isn't possible then return fs.ErrorCantMove
-func (f *Fs) move(source string, remote string) (*mega.MegaNode, error) {
-	srcNode, err := f.findObject(source)
+func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object, error) {
+	fmt.Printf("HERE12\n")
+	fs.Debugf(f, "Move %q -> %q", src.Remote(), remote)
+	srcObj, ok := src.(*Object)
+	if !ok {
+		fs.Debugf(f, "Can't move - not same remote type")
+		return nil, fs.ErrorCantMove
+	}
+
+	srcNode, err := f.findObject(src.Remote())
 	if err != nil {
 		return nil, err
 	}
@@ -722,33 +763,16 @@ func (f *Fs) move(source string, remote string) (*mega.MegaNode, error) {
 		return nil, fs.ErrorDirNotFound
 	}
 
-	destPath, destName := filepath.Split(remote)
-	dest, err = f.findDir(destPath)
-	if err != nil {
-		fs.Debugf(f, "Destination folder not found %s", destPath)
-		destParentPath, destFolderName := filepath.Split(destPath)
-
-		destParent, err := f.findDir(destParentPath)
-		if err != nil {
-			fs.Debugf(f, "Destination folder parent not found %s", destParentPath)
-			return nil, err
-		}
-
-		if err := f.mkdir(destFolderName, *destParent); err != nil {
-			fs.Debugf(f, "Destination folder creation failed")
-			return nil, err
-		}
-
-		dest, err = f.findDir(destPath)
-		if err != nil {
-			fs.Debugf(f, "Destination folder creation failed 2")
-			return nil, err
-		}
+	destNode, err := f.mkdirParent(remote)
+	if err != nil && err != fs.ErrorDirExists {
+		fs.Debugf(f, "Destination folder not found")
+		return nil, err
 	}
 
-	srcPath, srcName := filepath.Split(f.parsePath(source))
+	srcPath, srcName := filepath.Split(f.parsePath(src.Remote()))
+	destPath, destName := filepath.Split(f.parsePath(remote))
 	if srcPath != destPath {
-		if err := f.moveNode(*srcNode, *dest); err != nil {
+		if err := f.moveNode(*srcNode, *destNode); err != nil {
 			return nil, err
 		}
 	}
@@ -758,49 +782,54 @@ func (f *Fs) move(source string, remote string) (*mega.MegaNode, error) {
 		}
 	}
 
-	return srcNode, nil
-}
-
-func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object, error) {
-	fmt.Printf("HERE12\n")
-	fs.Debugf(f, "Move %q -> %q", src.Remote(), remote)
-	srcObj, ok := src.(*Object)
-	if !ok {
-		fs.Debugf(f, "Can't move - not same remote type")
-		return nil, fs.ErrorCantMove
-	}
-
-	srcNode, err := f.move(src.Remote(), remote)
-	if err != nil {
-		return nil, err
-	}
-
 	srcObj.remote = remote
 	// Shouldn't be necessary
 	srcObj.info = srcNode
 	return srcObj, nil
 }
 
+// DirMove moves src, srcRemote to this remote at dstRemote
+// using server-side move operations.
+//
+// Will only be called if src.Fs().Name() == f.Name()
+//
+// If it isn't possible then return fs.ErrorCantDirMove
+//
+// If destination exists then return fs.ErrorDirExists
 func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string) error {
-	// TODO: Default root creation breaks this
-	_, err := f.move(srcRemote, dstRemote)
-	return err
+	srcNode, err := f.findObject(srcRemote)
+	if err != nil {
+		return err
+	}
+
+	_, err = f.findObject(dstRemote)
+	if err != nil {
+		return err
+	}
+
+	dstNode, err := f.mkdirParent(dstRemote)
+	if err != nil && err != fs.ErrorDirExists {
+		return err
+	}
+
+	if err := f.moveNode(*srcNode, *dstNode); err != nil {
+		return err
+	}
+
+	return nil
 }
 
-func (f *Fs) write(ctx context.Context, dstObj *Object, in io.Reader, src fs.ObjectInfo, ignore_exist bool) (*Object, error) {
+func (f *Fs) write(ctx context.Context, dstObj *Object, in io.Reader, src fs.ObjectInfo, ignoreExist bool) (*Object, error) {
 	fmt.Printf("HERE1\n")
 	node, err := f.findObject(dstObj.remote)
-	if err != nil && !ignore_exist {
+	if err != nil && !ignoreExist {
 		return dstObj, err
 	}
 
-	dir := f.parsePath(dstObj.remote)
-	index := strings.LastIndex(dir, "/")
-	parentDir := dir[:index+1]
-	fileName := dir[index+1:]
-	pnode, err := f.findObject(parentDir)
-	if err != nil {
-		return dstObj, fmt.Errorf("failed to find parent folder")
+	pnode, err := f.mkdirParent(dstObj.remote)
+	if err != nil && err != fs.ErrorDirExists {
+		fs.Debugf(f, "Parent folder creation failed")
+		return nil, err
 	}
 
 	// Create a temporary file
@@ -825,6 +854,7 @@ func (f *Fs) write(ctx context.Context, dstObj *Object, in io.Reader, src fs.Obj
 	token := mega.MegaCancelTokenCreateInstance()
 	defer mega.DeleteMegaCancelToken(token)
 
+	_, fileName := filepath.Split(dstObj.remote)
 	// Somebody contact MEGA, ask them for a upload chunks interface :P
 	f.API().StartUpload(
 		tempFile.Name(),         //Localpath
