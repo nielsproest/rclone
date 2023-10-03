@@ -35,14 +35,16 @@ import (
 
 // Options defines the configuration for this backend
 type Options struct {
-	User          string               `config:"user"`
-	Pass          string               `config:"pass"`
-	Debug         bool                 `config:"debug"`
-	Cache         string               `config:"cache"`
-	HardDelete    bool                 `config:"hard_delete"`
-	UseHTTPS      bool                 `config:"use_https"`
-	WorkerThreads int                  `config:"worker_threads"`
-	Enc           encoder.MultiEncoder `config:"encoding"`
+	User            string               `config:"user"`
+	Pass            string               `config:"pass"`
+	Debug           bool                 `config:"debug"`
+	Cache           string               `config:"cache"`
+	HardDelete      bool                 `config:"hard_delete"`
+	UseHTTPS        bool                 `config:"use_https"`
+	WorkerThreads   int                  `config:"worker_threads"`
+	DownloadThreads int                  `config:"download_threads"`
+	UploadThreads   int                  `config:"upload_threads"`
+	Enc             encoder.MultiEncoder `config:"encoding"`
 }
 
 // Fs represents a remote mega
@@ -72,9 +74,11 @@ type Object struct {
 // Register with Fs
 func init() {
 	fs.Register(&fs.RegInfo{
-		Name:        "mega_native",
-		Description: "Mega Native",
-		NewFs:       NewFs,
+		Name: "mega_native",
+		Description: `Mega Native.
+
+The MEGA-SDK using the original C++ SDK's library.`,
+		NewFs: NewFs,
 		Options: []fs.Option{{
 			Name:      "user",
 			Help:      "User name.",
@@ -89,9 +93,10 @@ func init() {
 			Name: "cache",
 			Help: `MEGA State cache folder.
 
-Where to put MEGA state files.`,
+Where to put MEGA state files.
+These wont get deleted, so you will have to cleanup manually.`,
 			Default:  "mega_cache",
-			Advanced: true,
+			Required: true,
 		}, {
 			Name: "debug",
 			Help: `Output more debug from Mega.
@@ -121,9 +126,22 @@ Enabling it will increase CPU usage and add network overhead.`,
 			Default:  false,
 			Advanced: true,
 		}, {
-			Name:     "worker_threads",
-			Help:     `How many threads to use for decrypting.`,
-			Default:  4,
+			Name: "worker_threads",
+			Help: `The number of worker threads for encryption or other operations.
+
+Using worker threads means that synchronous function calls on MegaApi will be blocked less,
+and uploads and downloads can proceed more quickly on very fast connections.`,
+			Default:  2,
+			Advanced: true,
+		}, {
+			Name:     "download_threads",
+			Help:     `Set the maximum number of connections per transfer for downloads`,
+			Default:  3,
+			Advanced: true,
+		}, {
+			Name:     "upload_threads",
+			Help:     `Set the maximum number of connections per transfer for uploads`,
+			Default:  1,
 			Advanced: true,
 		}, {
 			Name:     config.ConfigEncoding,
@@ -165,31 +183,39 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		uint(opt.WorkerThreads))      // workerThreadCount
 	srv.AddListener(listener)
 
-	srv.UseHttpsOnly(opt.UseHTTPS)
-	listenerObj.Wait()
+	// Use HTTPS
 	listenerObj.Reset()
+	srv.UseHttpsOnly(opt.UseHTTPS, listener)
+	listenerObj.Wait()
 
-	/* TODO:
-	srv.SetMaxConnections
-	srv.SetUploadLimit, setMaxUploadSpeed (DIFFERENCE?)
-	srv.SetDownloadLimit
-	*/
+	// DL Threads
+	listenerObj.Reset()
+	srv.SetMaxConnections(mega.MegaTransferTYPE_DOWNLOAD, opt.DownloadThreads, listener)
+	listenerObj.Wait()
 
+	// UP Threads
+	listenerObj.Reset()
+	srv.SetMaxConnections(mega.MegaTransferTYPE_UPLOAD, opt.UploadThreads, listener)
+	listenerObj.Wait()
+
+	// TODO: Use debug for something
 	fs.Debugf("mega-native", "Trying log in...")
+
+	listenerObj.Reset()
 	srv.Login(opt.User, opt.Pass)
 	listenerObj.Wait()
+
 	megaerr := *listenerObj.GetError()
 	if megaerr.GetErrorCode() != mega.MegaErrorAPI_OK {
 		return nil, fmt.Errorf("couldn't login: %s", megaerr.ToString())
 	}
-	listenerObj.Reset()
 
 	fs.Debugf("mega-native", "Waiting for nodes...")
 	for listenerObj.cwd == nil {
 		time.Sleep(1 * time.Second)
 	}
 
-	root = filepath.Join("/", root)
+	root = filepath.Join("/", strings.TrimSuffix(root, "/"))
 	f := &Fs{
 		name:      name,
 		root:      root,
@@ -205,9 +231,10 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	// Find the root node and check if it is a file or not
 	fs.Debugf("mega-native", "Retrieving root node...")
 	rootNode := f.API().GetNodeByPath(root)
+	// This occurs in "move" operations, where the destionation filesystem shouldn't have a "root"
 	if rootNode.Swigcptr() == 0 {
 		fs.Debugf("mega-native", "Couldn't find root node!")
-		return f, nil
+		return f, nil // TODO: fs.ErrorObjectNotFound ?
 	}
 
 	f._rootNode = &rootNode
@@ -227,6 +254,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 }
 
 // ------------------------------------------------------------
+// Support functions
 
 // parsePath parses a mega 'url'
 func (f *Fs) parsePath(path string) (string, mega.MegaNode) {
@@ -288,13 +316,26 @@ func (f *Fs) hardDelete(node mega.MegaNode) error {
 	return nil
 }
 
+func (f *Fs) delete(node mega.MegaNode) error {
+	if f.opt.HardDelete {
+		if err := f.hardDelete(node); err != nil {
+			return err
+		}
+	} else {
+		if err := f.moveNode(node, f.API().GetRubbishNode()); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
 func (f *Fs) moveNode(node mega.MegaNode, dir mega.MegaNode) error {
 	listenerObj := MyMegaListener{}
 	listenerObj.cv = sync.NewCond(&listenerObj.m)
 	listener := mega.NewDirectorMegaRequestListener(&listenerObj)
 	defer mega.DeleteDirectorMegaRequestListener(listener)
 
-	// TODO: f.API().CheckMove(node, dir) is a thing?
 	f.API().MoveNode(node, dir, listener)
 	listenerObj.Wait()
 	defer listenerObj.Reset()
@@ -346,6 +387,23 @@ func (f *Fs) mkdirParent(path string) (*mega.MegaNode, error) {
 	return f.mkdir(_rootName, &_rootParentNode)
 }
 
+func (f *Fs) iterChildren(node mega.MegaNode) (<-chan mega.MegaNode, error) {
+	children := node.GetChildren()
+	if children.Swigcptr() == 0 {
+		return nil, fs.ErrorListAborted
+	}
+
+	dataCh := make(chan mega.MegaNode)
+	go func() {
+		defer close(dataCh)
+		for i := 0; i < children.Size(); i++ {
+			dataCh <- children.Get(i)
+		}
+	}()
+
+	return dataCh, nil
+}
+
 // Make directory and return it
 func (f *Fs) mkdir(name string, parent *mega.MegaNode) (*mega.MegaNode, error) {
 	listenerObj := MyMegaListener{}
@@ -364,13 +422,12 @@ func (f *Fs) mkdir(name string, parent *mega.MegaNode) (*mega.MegaNode, error) {
 	}
 
 	// Find resulting folder
-	children := (*parent).GetChildren()
-	if children.Swigcptr() == 0 {
+	children, err := f.iterChildren(*parent)
+	if err != nil {
 		return nil, fmt.Errorf("failed to find children of folder %s", name)
 	}
 
-	for i := 0; i < children.Size(); i++ {
-		node := children.Get(i)
+	for node := range children {
 		if node.GetName() == name && node.GetType() == mega.MegaNodeTYPE_FOLDER {
 			return &node, nil
 		}
@@ -390,15 +447,12 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 		return nil, err
 	}
 
-	children := f.API().GetChildren(*dirNode)
-	if children.Swigcptr() == 0 {
-		fmt.Printf("J2\n")
-		return nil, fmt.Errorf("couldn't list files")
+	children, err := f.iterChildren(*dirNode)
+	if err != nil {
+		return nil, err
 	}
 
-	fmt.Printf("M %d\n", children.Size())
-	for i := 0; i < children.Size(); i++ {
-		node := children.Get(i)
+	for node := range children {
 		remote := path.Join(dir, f.opt.Enc.ToStandardName(node.GetName()))
 		switch node.GetType() {
 		case mega.MegaNodeTYPE_FOLDER:
@@ -498,14 +552,8 @@ func (f *Fs) Rmdir(ctx context.Context, dir string) error {
 		return fmt.Errorf("folder not empty")
 	}*/
 
-	if f.opt.HardDelete {
-		if err := f.hardDelete(*n); err != nil {
-			return err
-		}
-	} else {
-		if err := f.moveNode(*n, f.API().GetRubbishNode()); err != nil {
-			return err
-		}
+	if err := f.delete(*n); err != nil {
+		return err
 	}
 
 	fs.Debugf(f, "Folder deleted OK")
@@ -513,53 +561,6 @@ func (f *Fs) Rmdir(ctx context.Context, dir string) error {
 }
 
 // ------------------------------------------------------------
-
-// ModTime implements fs.DirEntry.
-func (o *Object) ModTime(context.Context) time.Time {
-	fmt.Printf("test2\n")
-	if o.info != nil {
-		return intToTime((*o.info).GetModificationTime())
-	}
-	return time.Unix(0, 0)
-}
-
-// Remote implements fs.DirEntry.
-func (o *Object) Remote() string {
-	return o.remote
-}
-
-// Size implements fs.DirEntry.
-func (o *Object) Size() int64 {
-	fmt.Printf("HERE4\n")
-	if o.info != nil {
-		return (*o.info).GetSize()
-	}
-	return -1
-}
-
-// String implements fs.DirEntry.
-func (o *Object) String() string {
-	fmt.Printf("test3\n")
-	if o == nil {
-		return "<nil>"
-	}
-	path, _ := o.fs.parsePath(o.remote)
-	return path
-}
-
-// ------------------------------------------------------------
-
-// Fs returns the parent Fs
-func (o *Object) Fs() fs.Info {
-	return o.fs
-}
-
-// Hash implements fs.Object.
-func (o *Object) Hash(ctx context.Context, ty hash.Type) (string, error) {
-	// TODO: Is reportedly a "Base64-encoded CRC of the file. The CRC of a file is a hash of its contents"
-	// But i cant figure it out
-	return o.fs.API().GetCRC(*o.info), nil
-}
 
 // BufferedReaderCloser is a custom type that implements io.ReaderCloser
 type BufferedReaderCloser struct {
@@ -655,10 +656,13 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 	reader.obj = o
 	reader.listener = &listenerObj
 
+	// TODO: If listener.notified then its stopped, detect this
 	o.fs.API().StartStreaming(*o.info, offset, limit, listener)
 
 	return readers.NewLimitedReadCloser(reader, limit), nil
 }
+
+// ------------------------------------------------------------
 
 // Remove implements fs.Object.
 func (o *Object) Remove(ctx context.Context) error {
@@ -673,36 +677,12 @@ func (o *Object) Remove(ctx context.Context) error {
 		return fmt.Errorf("the path isn't a file")
 	}
 
-	if o.fs.opt.HardDelete {
-		if err := o.fs.hardDelete(n); err != nil {
-			return err
-		}
-	} else {
-		if err := o.fs.moveNode(n, o.fs.API().GetRubbishNode()); err != nil {
-			return err
-		}
+	if err := o.fs.delete(n); err != nil {
+		return err
 	}
 
 	fs.Debugf(o.fs, "File deleted OK")
 	return nil
-}
-
-// Update implements fs.Object.
-func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) error {
-	fmt.Printf("HERE5\n")
-	// TODO: Test this
-	_, err := (*o.fs).write(ctx, o, in, src, false)
-	return err
-}
-
-// SetModTime implements fs.Object.
-func (o *Object) SetModTime(ctx context.Context, t time.Time) error {
-	return fs.ErrorCantSetModTime
-}
-
-// Storable implements fs.Object.
-func (o *Object) Storable() bool {
-	return true
 }
 
 // ------------------------------------------------------------
@@ -727,14 +707,8 @@ func (f *Fs) Purge(ctx context.Context, dir string) error {
 		return fmt.Errorf("folder not empty")
 	}*/
 
-	if f.opt.HardDelete {
-		if err := f.hardDelete(*n); err != nil {
-			return err
-		}
-	} else {
-		if err := f.moveNode(*n, f.API().GetRubbishNode()); err != nil {
-			return err
-		}
+	if err := f.delete(*n); err != nil {
+		return err
 	}
 
 	fs.Debugf(f, "Folder purged OK")
@@ -896,19 +870,56 @@ func (f *Fs) write(ctx context.Context, dstObj *Object, in io.Reader, src fs.Obj
 	// Delete old node
 	err = nil
 	if node != nil {
+		// TODO: Is this correct and allows versioning, or should i move to trash?
 		err = f.hardDelete(*node)
 	}
 
 	return dstObj, err
 }
 
-func (f *Fs) PutUnchecked(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
-	dstObj := &Object{
-		fs:     f,
-		remote: src.Remote(),
+// MergeDirs merges the contents of all the directories passed
+// in into the first one and rmdirs the other directories.
+func (f *Fs) MergeDirs(ctx context.Context, dirs []fs.Directory) error {
+	fmt.Printf("PATH70")
+
+	// TODO: Test this
+
+	if len(dirs) < 2 {
+		return nil
 	}
 
-	return f.write(ctx, dstObj, in, src, false)
+	// find dst directory
+	dstDir := dirs[0]
+	dstNode := f.API().GetNodeByHandle(mega.MegaApiBase64ToHandle(dstDir.ID()))
+	if dstNode.Swigcptr() == 0 {
+		return fs.ErrorDirNotFound
+	}
+
+	for _, srcDir := range dirs[1:] {
+		srcNode := f.API().GetNodeByHandle(mega.MegaApiBase64ToHandle(srcDir.ID()))
+		if srcNode.Swigcptr() == 0 {
+			return fs.ErrorObjectNotFound
+		}
+
+		children, err := f.iterChildren(srcNode)
+		if err != nil {
+			return err
+		}
+
+		for node := range children {
+			if err := f.moveNode(node, dstNode); err != nil {
+				return err
+			}
+
+			// TODO: Is this correct and allows versioning, or should i move to trash?
+			if err := f.hardDelete(node); err != nil {
+				return err
+			}
+		}
+
+	}
+
+	return nil
 }
 
 // ------------------------------------------------------------
@@ -933,14 +944,7 @@ func (f *Fs) About(ctx context.Context) (*fs.Usage, error) {
 	return usage, nil
 }
 
-// MergeDirs implements fs.MergeDirser.
-func (f *Fs) MergeDirs(ctx context.Context, dirs []fs.Directory) error {
-	fmt.Printf("PATH70")
-	// TODO: .
-	return fs.ErrorNotImplemented
-}
-
-// PublicLink implements fs.PublicLinker.
+// PublicLink generates a public link to the remote path (usually readable by anyone)
 func (f *Fs) PublicLink(ctx context.Context, remote string, expire fs.Duration, unlink bool) (string, error) {
 	fmt.Printf("PATH71")
 	node := f.API().GetNodeByPath(f.parsePath(remote))
@@ -955,6 +959,78 @@ func (f *Fs) PublicLink(ctx context.Context, remote string, expire fs.Duration, 
 	}
 
 	return link, err
+}
+
+func (f *Fs) PutUnchecked(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
+	dstObj := &Object{
+		fs:     f,
+		remote: src.Remote(),
+	}
+
+	return f.write(ctx, dstObj, in, src, false)
+}
+
+// Update implements fs.Object.
+func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) error {
+	fmt.Printf("HERE5\n")
+	// TODO: Test this
+	_, err := (*o.fs).write(ctx, o, in, src, false)
+	return err
+}
+
+// ModTime implements fs.DirEntry.
+func (o *Object) ModTime(context.Context) time.Time {
+	fmt.Printf("test2\n")
+	if o.info != nil {
+		return intToTime((*o.info).GetModificationTime())
+	}
+	return time.Unix(0, 0)
+}
+
+// Remote implements fs.DirEntry.
+func (o *Object) Remote() string {
+	return o.remote
+}
+
+// Size implements fs.DirEntry.
+func (o *Object) Size() int64 {
+	fmt.Printf("HERE4\n")
+	if o.info != nil {
+		return (*o.info).GetSize()
+	}
+	return -1
+}
+
+// String implements fs.DirEntry.
+func (o *Object) String() string {
+	fmt.Printf("test3\n")
+	if o == nil {
+		return "<nil>"
+	}
+	path, _ := o.fs.parsePath(o.remote)
+	return path
+}
+
+// Fs returns the parent Fs
+func (o *Object) Fs() fs.Info {
+	return o.fs
+}
+
+// Hash implements fs.Object.
+func (o *Object) Hash(ctx context.Context, ty hash.Type) (string, error) {
+	// TODO: Is reportedly a "Base64-encoded CRC of the file. The CRC of a file is a hash of its contents"
+	// But i cant figure it out
+	return o.fs.API().GetCRC(*o.info), nil
+}
+
+// SetModTime implements fs.Object.
+func (o *Object) SetModTime(ctx context.Context, t time.Time) error {
+	return fs.ErrorCantSetModTime
+}
+
+// Storable implements fs.Object.
+func (o *Object) Storable() bool {
+	return true
 }
 
 // DirCacheFlush implements fs.DirCacheFlusher.
