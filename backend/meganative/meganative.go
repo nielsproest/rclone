@@ -61,13 +61,14 @@ const (
 
 // Options defines the configuration for this backend
 type Options struct {
-	User       string               `config:"user"`
-	Pass       string               `config:"pass"`
-	Cache      string               `config:"cache"`
-	Debug      bool                 `config:"debug"`
-	HardDelete bool                 `config:"hard_delete"`
-	UseHTTPS   bool                 `config:"use_https"`
-	Enc        encoder.MultiEncoder `config:"encoding"`
+	User          string               `config:"user"`
+	Pass          string               `config:"pass"`
+	Cache         string               `config:"cache"`
+	Debug         bool                 `config:"debug"`
+	HardDelete    bool                 `config:"hard_delete"`
+	UseHTTPS      bool                 `config:"use_https"`
+	WorkerThreads int                  `config:"worker_threads"`
+	Enc           encoder.MultiEncoder `config:"encoding"`
 }
 
 // Fs represents a remote mega
@@ -146,8 +147,7 @@ func init() {
 			Help: `MEGA State cache folder.
 
 Where to put MEGA state files.`,
-			Default:  "",
-			Required: false,
+			Default:  "megacache",
 			Advanced: true,
 		}, {
 			Name: "debug",
@@ -176,6 +176,11 @@ Enabling this will force MEGA to use HTTPS for all transfers.
 HTTPS is normally not necessary since all data is already encrypted anyway.
 Enabling it will increase CPU usage and add network overhead.`,
 			Default:  false,
+			Advanced: true,
+		}, {
+			Name:     "worker_threads",
+			Help:     `How many threads to use for decrypting.`,
+			Default:  4,
 			Advanced: true,
 		}, {
 			Name:     config.ConfigEncoding,
@@ -212,9 +217,9 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	// TODO: Generate code at: https://mega.co.nz/#sdk
 	srv := mega.NewMegaApi(
 		"ht1gUZLZ",                   // appKey
-		"megacache",                  // basePath
+		opt.Cache,                    // basePath
 		"MEGA/SDK Rclone filesystem", // userAgent
-		uint(4))                      // workerThreadCount
+		uint(opt.WorkerThreads))      // workerThreadCount
 	srv.AddListener(listener)
 
 	srv.UseHttpsOnly(opt.UseHTTPS)
@@ -396,6 +401,7 @@ func (f *Fs) mkdir(name string, parent *mega.MegaNode) (*mega.MegaNode, error) {
 	listener := mega.NewDirectorMegaRequestListener(&listenerObj)
 	defer mega.DeleteDirectorMegaRequestListener(listener)
 
+	// Create folder
 	f.API().CreateFolder(name, parent, listener)
 	listenerObj.Wait()
 	defer listenerObj.Reset()
@@ -405,6 +411,7 @@ func (f *Fs) mkdir(name string, parent *mega.MegaNode) (*mega.MegaNode, error) {
 		return nil, fmt.Errorf("MEGA Mkdir Error: %s", megaerr.ToString())
 	}
 
+	// Find resulting folder
 	children := (*parent).GetChildren()
 	if children.Swigcptr() == 0 {
 		return nil, fmt.Errorf("failed to find children of folder %s", name)
@@ -463,13 +470,16 @@ func (f *Fs) Mkdir(ctx context.Context, dir string) error {
 	fmt.Printf("HERE11\n")
 	_, err := f.findDir(dir)
 	if err == nil {
-		return fmt.Errorf("Mkdir failed: %w", err)
+		return fs.ErrorDirExists
 	}
 
 	srcPath, srcName := filepath.Split(dir)
 	n, err := f.findDir(srcPath)
-	if err != nil || (*n).IsFile() {
+	if err != nil {
 		return err
+	}
+	if (*n).IsFile() {
+		return fs.ErrorIsFile
 	}
 
 	_, err = f.mkdir(srcName, n)
@@ -760,7 +770,7 @@ func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object,
 	dest, err := f.findObject(remote)
 	if err == nil && (*dest).IsFile() {
 		fs.Debugf(f, "The destination is an existing file")
-		return nil, fs.ErrorDirNotFound
+		return nil, fs.ErrorIsFile
 	}
 
 	destNode, err := f.mkdirParent(remote)
@@ -797,23 +807,35 @@ func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object,
 //
 // If destination exists then return fs.ErrorDirExists
 func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string) error {
-	srcNode, err := f.findObject(srcRemote)
+	dstFs := f
+	srcFs, ok := src.(*Fs)
+	if !ok {
+		fs.Debugf(srcFs, "Can't move directory - not same remote type")
+		return fs.ErrorCantDirMove
+	}
+
+	fmt.Printf("DirMove: %s -> %s\n", srcFs.parsePath(srcRemote), dstFs.parsePath(dstRemote))
+	srcNode, err := srcFs.findDir(srcRemote)
 	if err != nil {
 		return err
 	}
 
-	_, err = f.findObject(dstRemote)
-	if err != nil {
-		return err
-	}
-
-	dstNode, err := f.mkdirParent(dstRemote)
+	dstNode, err := dstFs.mkdirParent(dstRemote)
 	if err != nil && err != fs.ErrorDirExists {
 		return err
 	}
 
-	if err := f.moveNode(*srcNode, *dstNode); err != nil {
-		return err
+	srcPath, srcName := filepath.Split(srcFs.parsePath(srcRemote))
+	destPath, destName := filepath.Split(dstFs.parsePath(dstRemote))
+	if srcPath != destPath {
+		if err := f.moveNode(*srcNode, *dstNode); err != nil {
+			return err
+		}
+	}
+	if srcName != destName {
+		if err := f.renameNode(*srcNode, destName); err != nil {
+			return err
+		}
 	}
 
 	return nil
