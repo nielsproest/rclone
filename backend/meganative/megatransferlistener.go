@@ -6,6 +6,10 @@ import (
 	"sync"
 )
 
+/*
+The transfer listener for download and uploads
+*/
+
 type BufferWriter interface {
 	WriteToBuffer(data []byte) error
 	EOF()
@@ -39,12 +43,16 @@ func (l *MyMegaTransferListener) OnTransferFinish(api mega.MegaApi, transfer meg
 	l.notified = true
 	l.cv.Broadcast()
 
-	l.out.EOF()
+	if l.out != nil {
+		l.out.EOF()
+	}
 }
 
 func (l *MyMegaTransferListener) OnTransferData(api mega.MegaApi, transfer mega.MegaTransfer, buffer string, size int64) bool {
-	buf := []byte(buffer[:size])
-	l.out.WriteToBuffer(buf)
+	if l.out != nil {
+		buf := []byte(buffer[:size])
+		l.out.WriteToBuffer(buf)
+	}
 	return true
 }
 

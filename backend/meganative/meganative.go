@@ -639,7 +639,7 @@ func (f *Fs) Rmdir(ctx context.Context, dir string) error {
 
 // BufferedReaderCloser is a custom type that implements io.ReaderCloser
 type BufferedReaderCloser struct {
-	buffer   []byte
+	buffer   chan []byte
 	bufferMu sync.Mutex
 	closed   bool
 	obj      *Object
@@ -647,30 +647,23 @@ type BufferedReaderCloser struct {
 }
 
 // NewBufferedReaderCloser creates a new BufferedReaderCloser with a specified buffer size.
-func NewBufferedReaderCloser() *BufferedReaderCloser {
+func NewBufferedReaderCloser(bufferSize int) *BufferedReaderCloser {
 	return &BufferedReaderCloser{
-		buffer: []byte{},
+		buffer: make(chan []byte, bufferSize),
 		closed: false,
 	}
 }
 
 // Read reads data from the buffer.
 func (b *BufferedReaderCloser) Read(p []byte) (n int, err error) {
-	for len(b.buffer) == 0 && !b.closed {
-		time.Sleep(time.Millisecond * 10)
+	select {
+	case data, ok := <-b.buffer:
+		if !ok {
+			return 0, fmt.Errorf("read on closed file")
+		}
+		n = copy(p, data)
+		return n, nil
 	}
-
-	if b.closed {
-		return 0, fmt.Errorf("read on closed file")
-	}
-
-	b.bufferMu.Lock()
-	defer b.bufferMu.Unlock()
-
-	n = copy(p, b.buffer)
-	b.buffer = b.buffer[n:]
-
-	return n, nil
 }
 
 // Close closes the BufferedReaderCloser.
@@ -687,7 +680,11 @@ func (b *BufferedReaderCloser) Close() error {
 	}
 	defer mega.DeleteDirectorMegaTransferListener(*b.listener.director)
 
-	b.closed = true
+	if !b.closed {
+		close(b.buffer)
+		b.closed = true
+	}
+
 	return nil
 }
 
@@ -699,8 +696,9 @@ func (b *BufferedReaderCloser) WriteToBuffer(data []byte) error {
 	if b.closed {
 		return io.ErrClosedPipe
 	}
-	// TODO: Use a better buffer with pre-allocation and wait if full
-	b.buffer = append(b.buffer, data...)
+
+	// Block if the buffer is full
+	b.buffer <- data
 
 	return nil
 }
@@ -709,7 +707,7 @@ func (b *BufferedReaderCloser) EOF() {
 	defer b.bufferMu.Unlock()
 
 	fmt.Printf("FILE EOF\n")
-	// TODO: Do something here
+	b.closed = true
 }
 
 // Open implements fs.Object.
@@ -746,76 +744,11 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 	listenerObj.director = &listener
 
 	// 1KB buffer
-	reader := NewBufferedReaderCloser()
+	reader := NewBufferedReaderCloser(1024)
 	listenerObj.out = reader
 	reader.obj = o
 	reader.listener = &listenerObj
 
-	/*
-		// TODO: Fix deletion bug that empties files
-		2023/10/04 13:40:26 DEBUG : New Text Document.txt: >Open: fh=&{New Text Document.txt (rw)}, err=<nil>
-		2023/10/04 13:40:26 DEBUG : &{New Text Document.txt (rw)}: Read: len=77824, offset=0
-		2023/10/04 13:40:26 DEBUG : New Text Document.txt(0xc000e08380): _readAt: size=77824, off=0
-		2023/10/04 13:40:26 DEBUG : New Text Document.txt(0xc000e08380): openPending:
-		HERE4
-		test2
-		2023/10/04 13:40:26 DEBUG : New Text Document.txt: vfs cache: checking remote fingerprint "0,2023-10-04 11:30:35 +0000 UTC" against cached fingerprint "29,2023-10-04 11:30:35 +0000 UTC"
-		2023/10/04 13:40:26 DEBUG : New Text Document.txt: vfs cache: remote object has changed but local object modified - keeping it (remote fingerprint "0,2023-10-04 11:30:35 +0000 UTC" != cached fingerprint "29,2023-10-04 11:30:35 +0000 UTC")
-		HERE4
-		2023/10/04 13:40:26 DEBUG : New Text Document.txt: vfs cache: truncate to size=75195 (not needed as size correct)
-		2023/10/04 13:40:26 INFO  : New Text Document.txt: vfs cache: removed cache file as item.open failed on _createFile, remove cache data/metadata files
-		2023/10/04 13:40:26 DEBUG : New Text Document.txt: vfs cache: removed metadata from cache as item.open failed on _createFile, remove cache data/metadata files
-		2023/10/04 13:40:26 ERROR : New Text Document.txt: vfs cache: failed to open item: vfs cache item: create cache file failed: vfs cache item: internal error: didn't Close file
-		2023/10/04 13:40:26 ERROR : New Text Document.txt: Non-out-of-space error encountered during open
-		2023/10/04 13:40:26 DEBUG : New Text Document.txt(0xc000e08380): >openPending: err=open RW handle failed to open cache file: vfs cache item: create cache file failed: vfs cache item: internal error: didn't Close file
-		2023/10/04 13:40:26 DEBUG : New Text Document.txt(0xc000e08380): >_readAt: n=0, err=open RW handle failed to open cache file: vfs cache item: create cache file failed: vfs cache item: internal error: didn't Close file
-		2023/10/04 13:40:26 ERROR : IO error: open RW handle failed to open cache file: vfs cache item: create cache file failed: vfs cache item: internal error: didn't Close file
-		2023/10/04 13:40:26 DEBUG : &{New Text Document.txt (rw)}: >Read: read=0, err=open RW handle failed to open cache file: vfs cache item: create cache file failed: vfs cache item: internal error: didn't Close file
-		2023/10/04 13:40:26 DEBUG : &{New Text Document.txt (rw)}: Read: len=4096, offset=0
-		2023/10/04 13:40:26 DEBUG : New Text Document.txt(0xc000e08380): _readAt: size=4096, off=0
-		HERE4
-		2023/10/04 13:40:26 DEBUG : New Text Document.txt(0xc000e08380): >_readAt: n=0, err=EOF
-	*/
-
-	/* TODO: Reader freezes
-	2023/10/04 14:03:22 DEBUG : New Text Document.txt: Open: flags=OpenReadOnly+OpenNonblock
-	2023/10/04 14:03:22 DEBUG : New Text Document.txt: Open: flags=O_RDONLY|0x800
-	2023/10/04 14:03:22 DEBUG : New Text Document.txt: newRWFileHandle:
-	2023/10/04 14:03:22 DEBUG : New Text Document.txt: >newRWFileHandle: err=<nil>
-	2023/10/04 14:03:22 DEBUG : New Text Document.txt: >Open: fd=New Text Document.txt (rw), err=<nil>
-	HERE4
-	2023/10/04 14:03:22 DEBUG : New Text Document.txt: >Open: fh=&{New Text Document.txt (rw)}, err=<nil>
-	2023/10/04 14:03:22 DEBUG : &{New Text Document.txt (rw)}: Read: len=77824, offset=0
-	2023/10/04 14:03:22 DEBUG : New Text Document.txt(0xc0003fed00): _readAt: size=77824, off=0
-	2023/10/04 14:03:22 DEBUG : New Text Document.txt(0xc0003fed00): openPending:
-	HERE4
-	test2
-	2023/10/04 14:03:22 DEBUG : New Text Document.txt: vfs cache: checking remote fingerprint "75195,2023-10-04 11:42:07 +0000 UTC" against cached fingerprint "75195,2023-10-04 11:42:07 +0000 UTC"
-	HERE4
-	2023/10/04 14:03:22 DEBUG : New Text Document.txt: vfs cache: truncate to size=75195 (not needed as size correct)
-	2023/10/04 14:03:22 DEBUG : : Added virtual directory entry vAddFile: "New Text Document.txt"
-	2023/10/04 14:03:22 DEBUG : New Text Document.txt(0xc0003fed00): >openPending: err=<nil>
-	2023/10/04 14:03:22 DEBUG : vfs cache: looking for range={Pos:0 Size:75195} in [] - present false
-	HERE4
-	HERE4
-	test3
-	2023/10/04 14:03:22 DEBUG : New Text Document.txt: ChunkedReader.RangeSeek from -1 to 0 length -1
-	HERE4
-	test3
-	2023/10/04 14:03:22 DEBUG : New Text Document.txt: ChunkedReader.Read at -1 length 32768 chunkOffset 0 chunkSize 134217728
-	test3
-	2023/10/04 14:03:22 DEBUG : New Text Document.txt: ChunkedReader.openRange at 0 length 134217728
-	FILE OPEN
-	HERE4
-	HERE4
-	HERE4
-	FILE EOF
-	FILE CLOSE
-	HERE4
-	HERE4
-	test3
-	INFO: Request finished with error
-	*/
 	// TODO: If listener.notified then its stopped, detect this
 	listenerObj.Reset()
 	o.fs.API().StartStreaming(*o.info, offset, limit, listener)
