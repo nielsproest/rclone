@@ -230,13 +230,13 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	// Find the root node and check if it is a file or not
 	fs.Debugf("mega-native", "Retrieving root node...")
 	rootNode := f.API().GetNodeByPath(root)
+
 	// This occurs in "move" operations, where the destionation filesystem shouldn't have a "root"
 	if rootNode.Swigcptr() == 0 {
 		fs.Debugf("mega-native", "Couldn't find root node!")
-		return f, nil // TODO: fs.ErrorObjectNotFound ?
+		return f, nil
 	}
 
-	//f._rootNode = &rootNode
 	switch rootNode.GetType() {
 	case mega.MegaNodeTYPE_FOLDER:
 		// root node found and is a directory
