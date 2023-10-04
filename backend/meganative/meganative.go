@@ -660,7 +660,6 @@ func NewBufferedReaderCloser(bufferSize int) *BufferedReaderCloser {
 
 // Read reads data from the buffer.
 func (b *BufferedReaderCloser) Read(p []byte) (n int, err error) {
-	// TODO: Do we EOF because MEGA is faster than us?
 	select {
 	case data := <-b.readCh:
 		n = copy(p, data)
@@ -685,6 +684,13 @@ func (b *BufferedReaderCloser) Close() error {
 		close(b.closeCh)
 		b.closed = true
 	}
+
+	b.listener.Wait()
+	megaerr := *b.listener.GetError()
+	if megaerr.GetErrorCode() != mega.MegaErrorAPI_OK {
+		return fmt.Errorf("couldn't download: %s", megaerr.ToString())
+	}
+
 	return nil
 }
 
@@ -698,6 +704,7 @@ func (b *BufferedReaderCloser) WriteToBuffer(data []byte) error {
 	}
 	copy(b.buffer, data)
 	b.readCh <- b.buffer
+
 	return nil
 }
 func (b *BufferedReaderCloser) EOF() {
@@ -705,7 +712,11 @@ func (b *BufferedReaderCloser) EOF() {
 	defer b.bufferMu.Unlock()
 
 	fmt.Printf("FILE EOF\n")
-	b.closeCh <- struct{}{}
+	if !b.closed {
+		close(b.readCh) // Close the read channel to indicate EOF
+		close(b.closeCh)
+		b.closed = true
+	}
 }
 
 // Open implements fs.Object.
@@ -726,6 +737,12 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 	}
 
 	// Bigger than file limit
+	if 0 > offset {
+		offset = 0
+	}
+	if offset > o.Size() {
+		return nil, fmt.Errorf("beyond file size")
+	}
 	if 0 > limit || limit+offset > o.Size() {
 		limit = o.Size() - offset
 	}
@@ -808,6 +825,7 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 	INFO: Request finished with error
 	*/
 	// TODO: If listener.notified then its stopped, detect this
+	listenerObj.Reset()
 	o.fs.API().StartStreaming(*o.info, offset, limit, listener)
 
 	return readers.NewLimitedReadCloser(reader, limit), nil
@@ -1017,6 +1035,11 @@ func (f *Fs) write(ctx context.Context, dstObj *Object, in io.Reader, src fs.Obj
 		listener,                //Listener
 	)
 	listenerObj.Wait()
+	megaerr := *listenerObj.GetError()
+	if megaerr.GetErrorCode() != mega.MegaErrorAPI_OK {
+		return nil, fmt.Errorf("couldn't upload: %s", megaerr.ToString())
+	}
+
 	/* TODO: Fix some save bug
 	2023/10/04 13:23:02 DEBUG : New Text Document.txt: vfs cache: truncate to size=0 (not needed as size correct)
 	2023/10/04 13:23:02 DEBUG : : Added virtual directory entry vAddFile: "New Text Document.txt"
