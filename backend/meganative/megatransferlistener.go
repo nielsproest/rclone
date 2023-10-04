@@ -48,9 +48,15 @@ func (l *MyMegaTransferListener) OnTransferFinish(api mega.MegaApi, transfer meg
 	}
 }
 
-func (l *MyMegaTransferListener) OnTransferData(api mega.MegaApi, transfer mega.MegaTransfer, buffer string, size int64) bool {
-	if l.out != nil {
-		buf := []byte(buffer[:size])
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+func (l *MyMegaTransferListener) OnTransferData(api mega.MegaApi, transfer mega.MegaTransfer, buffer string) bool {
+	if l.out != nil && len(buffer) > 0 {
+		buf := []byte(buffer)
 		l.out.WriteToBuffer(buf)
 	}
 	return true

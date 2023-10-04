@@ -652,7 +652,7 @@ func (f *Fs) Rmdir(ctx context.Context, dir string) error {
 // ------------------------------------------------------------
 
 // BufferedReaderCloser is a custom type that implements io.ReaderCloser
-type BufferedReaderCloser struct {
+/*type BufferedReaderCloser struct {
 	buffer   chan []byte
 	bufferMu sync.Mutex
 	closed   bool
@@ -722,6 +722,80 @@ func (b *BufferedReaderCloser) EOF() {
 
 	fmt.Printf("FILE EOF\n")
 	b.closed = true
+}*/
+// BufferedReaderCloser is a custom type that implements io.ReaderCloser
+type BufferedReaderCloser struct {
+	buffer   []byte
+	bufferMu sync.Mutex
+	closed   bool
+	obj      *Object
+	listener *MyMegaTransferListener
+}
+
+// NewBufferedReaderCloser creates a new BufferedReaderCloser with a specified buffer size.
+func NewBufferedReaderCloser(bufferSize int) *BufferedReaderCloser {
+	return &BufferedReaderCloser{
+		buffer: []byte{},
+		closed: false,
+	}
+}
+
+// Read reads data from the buffer.
+func (b *BufferedReaderCloser) Read(p []byte) (n int, err error) {
+	for len(b.buffer) == 0 && !b.closed {
+		time.Sleep(time.Millisecond * 100)
+	}
+
+	if b.closed {
+		return 0, fmt.Errorf("read on closed file")
+	}
+
+	b.bufferMu.Lock()
+	defer b.bufferMu.Unlock()
+
+	n = copy(p, b.buffer)
+	b.buffer = b.buffer[n:]
+
+	return n, nil
+}
+
+// Close closes the BufferedReaderCloser.
+func (b *BufferedReaderCloser) Close() error {
+	b.bufferMu.Lock()
+	defer b.bufferMu.Unlock()
+
+	fmt.Printf("FILE CLOSE\n")
+
+	// Ask Mega kindly to stop
+	transfer := b.listener.GetTransfer()
+	if transfer != nil {
+		b.obj.fs.API().CancelTransfer(*transfer)
+	}
+	defer mega.DeleteDirectorMegaTransferListener(*b.listener.director)
+
+	b.closed = true
+	return nil
+}
+
+// WriteToBuffer writes data to the buffer.
+func (b *BufferedReaderCloser) WriteToBuffer(data []byte) error {
+	b.bufferMu.Lock()
+	defer b.bufferMu.Unlock()
+
+	if b.closed {
+		return io.ErrClosedPipe
+	}
+	// TODO: Use a better buffer with pre-allocation and wait if full
+	b.buffer = append(b.buffer, data...)
+
+	return nil
+}
+func (b *BufferedReaderCloser) EOF() {
+	b.bufferMu.Lock()
+	defer b.bufferMu.Unlock()
+
+	fmt.Printf("FILE EOF\n")
+	// TODO: Do something here
 }
 
 // Open implements fs.Object.
