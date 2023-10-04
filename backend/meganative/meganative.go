@@ -182,6 +182,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	srv.AddRequestListener(listener)
 
 	// Use HTTPS
+	// TODO: Should i check for errors here?
 	listenerObj.Reset()
 	srv.UseHttpsOnly(opt.UseHTTPS, listener)
 	listenerObj.Wait()
@@ -674,10 +675,14 @@ func NewBufferedReaderCloser(bufferSize int) *BufferedReaderCloser {
 
 // Check if the buffer size exceeds double the bufferSize
 func (b *BufferedReaderCloser) CheckExceeds() {
+	if len(b.buffer) < b.bufferSize {
+		return
+	}
+
 	_transfer := b.listener.GetTransfer()
 	if _transfer != nil {
 		transfer := *_transfer
-		if transfer.GetState() == mega.MegaTransferSTATE_ACTIVE && len(b.buffer) > 2*b.bufferSize {
+		if transfer.GetState() == mega.MegaTransferSTATE_ACTIVE {
 			b.obj.fs.setPause(transfer, true)
 		}
 	}
@@ -685,10 +690,14 @@ func (b *BufferedReaderCloser) CheckExceeds() {
 
 // Check if the buffer size is less or equal to the buffer size
 func (b *BufferedReaderCloser) CheckLess() {
+	if len(b.buffer) > b.bufferSize/2 {
+		return
+	}
+
 	_transfer := b.listener.GetTransfer()
 	if _transfer != nil {
 		transfer := *_transfer
-		if transfer.GetState() == mega.MegaTransferSTATE_PAUSED && len(b.buffer) <= b.bufferSize {
+		if transfer.GetState() == mega.MegaTransferSTATE_PAUSED {
 			b.obj.fs.setPause(transfer, false)
 		}
 	}
@@ -800,8 +809,9 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 	// Create listener
 	listenerObj, listener := getTransferListener()
 
-	// 5MB buffer
-	reader := NewBufferedReaderCloser(1024 * 1024 * 5)
+	// 4MB buffer
+	// TODO: Config this?
+	reader := NewBufferedReaderCloser(1024 * 1024 * 4)
 	listenerObj.out = reader
 	reader.obj = o
 	reader.listener = listenerObj
