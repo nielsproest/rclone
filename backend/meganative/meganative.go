@@ -641,32 +641,35 @@ func (f *Fs) Rmdir(ctx context.Context, dir string) error {
 type BufferedReaderCloser struct {
 	buffer   []byte
 	bufferMu sync.Mutex
-	readCh   chan []byte
-	closeCh  chan struct{}
 	closed   bool
 	obj      *Object
 	listener *MyMegaTransferListener
 }
 
 // NewBufferedReaderCloser creates a new BufferedReaderCloser with a specified buffer size.
-func NewBufferedReaderCloser(bufferSize int) *BufferedReaderCloser {
+func NewBufferedReaderCloser() *BufferedReaderCloser {
 	return &BufferedReaderCloser{
-		buffer:  make([]byte, bufferSize),
-		readCh:  make(chan []byte),
-		closeCh: make(chan struct{}),
-		closed:  false,
+		buffer: []byte{},
+		closed: false,
 	}
 }
 
 // Read reads data from the buffer.
 func (b *BufferedReaderCloser) Read(p []byte) (n int, err error) {
-	select {
-	case data := <-b.readCh:
-		n = copy(p, data)
-		return n, nil
-	case <-b.closeCh:
-		return 0, io.EOF
+	for len(b.buffer) == 0 && !b.closed {
+		time.Sleep(time.Millisecond * 10)
 	}
+
+	if b.closed {
+		return 0, fmt.Errorf("read on closed file")
+	}
+
+	b.bufferMu.Lock()
+	defer b.bufferMu.Unlock()
+
+	n = copy(p, b.buffer)
+	b.buffer = b.buffer[n:]
+	return n, nil
 }
 
 // Close closes the BufferedReaderCloser.
@@ -677,20 +680,13 @@ func (b *BufferedReaderCloser) Close() error {
 	fmt.Printf("FILE CLOSE\n")
 
 	// Ask Mega kindly to stop
-	b.obj.fs.API().CancelTransfer(*b.listener.GetTransfer())
+	transfer := b.listener.GetTransfer()
+	if transfer != nil {
+		b.obj.fs.API().CancelTransfer(*transfer)
+	}
 	defer mega.DeleteDirectorMegaTransferListener(*b.listener.director)
 
-	if !b.closed {
-		close(b.closeCh)
-		b.closed = true
-	}
-
-	b.listener.Wait()
-	megaerr := *b.listener.GetError()
-	if megaerr.GetErrorCode() != mega.MegaErrorAPI_OK {
-		return fmt.Errorf("couldn't download: %s", megaerr.ToString())
-	}
-
+	b.closed = true
 	return nil
 }
 
@@ -702,8 +698,7 @@ func (b *BufferedReaderCloser) WriteToBuffer(data []byte) error {
 	if b.closed {
 		return io.ErrClosedPipe
 	}
-	copy(b.buffer, data)
-	b.readCh <- b.buffer
+	b.buffer = append(b.buffer, data...)
 
 	return nil
 }
@@ -712,16 +707,15 @@ func (b *BufferedReaderCloser) EOF() {
 	defer b.bufferMu.Unlock()
 
 	fmt.Printf("FILE EOF\n")
-	if !b.closed {
-		close(b.readCh) // Close the read channel to indicate EOF
+	/*if !b.closed {
 		close(b.closeCh)
 		b.closed = true
-	}
+	}*/
 }
 
 // Open implements fs.Object.
 func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadCloser, error) {
-	fmt.Printf("FILE OPEN\n")
+	fmt.Printf("FILE OPEN: %s\n", o.Remote())
 	var offset, limit int64 = 0, -1
 	for _, option := range options {
 		switch x := option.(type) {
@@ -746,7 +740,6 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 	if 0 > limit || limit+offset > o.Size() {
 		limit = o.Size() - offset
 	}
-
 	// Create listener
 	listenerObj := MyMegaTransferListener{}
 	listenerObj.cv = sync.NewCond(&listenerObj.m)
@@ -754,7 +747,7 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 	listenerObj.director = &listener
 
 	// 1KB buffer
-	reader := NewBufferedReaderCloser(1024)
+	reader := NewBufferedReaderCloser()
 	listenerObj.out = reader
 	reader.obj = o
 	reader.listener = &listenerObj

@@ -29,7 +29,7 @@ func (l *MyMegaTransferListener) OnTransferFinish(api mega.MegaApi, transfer meg
 	l.err = &err
 
 	if err.GetErrorCode() != mega.MegaErrorAPI_OK {
-		fmt.Printf("INFO: Transfer finished with error\n")
+		fmt.Printf("INFO: Transfer finished with error %s\n", err.ToString())
 		return
 	}
 
@@ -43,7 +43,7 @@ func (l *MyMegaTransferListener) OnTransferFinish(api mega.MegaApi, transfer meg
 }
 
 func (l *MyMegaTransferListener) OnTransferData(api mega.MegaApi, transfer mega.MegaTransfer, buffer string, size int64) bool {
-	buf := []byte(buffer)
+	buf := []byte(buffer[:size])
 	l.out.WriteToBuffer(buf)
 	return true
 }
