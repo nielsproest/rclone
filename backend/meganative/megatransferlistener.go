@@ -32,11 +32,6 @@ func (l *MyMegaTransferListener) OnTransferFinish(api mega.MegaApi, transfer meg
 	l.transfer = &req
 	l.err = &err
 
-	if err.GetErrorCode() != mega.MegaErrorAPI_OK {
-		fmt.Printf("INFO: Transfer finished with error %s\n", err.ToString())
-		return
-	}
-
 	l.m.Lock()
 	defer l.m.Unlock()
 
@@ -45,6 +40,11 @@ func (l *MyMegaTransferListener) OnTransferFinish(api mega.MegaApi, transfer meg
 
 	if l.out != nil {
 		l.out.EOF()
+	}
+
+	if err.GetErrorCode() != mega.MegaErrorAPI_OK {
+		fmt.Printf("INFO: Transfer finished with error %s\n", err.ToString())
+		return
 	}
 }
 

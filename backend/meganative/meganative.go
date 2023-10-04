@@ -211,7 +211,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 
 	fs.Debugf("mega-native", "Waiting for nodes...")
 	for listenerObj.cwd == nil {
-		time.Sleep(1 * time.Second)
+		time.Sleep(100 * time.Millisecond)
 	}
 
 	root = filepath.Join("/", strings.TrimSuffix(root, "/"))
@@ -915,6 +915,14 @@ func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object,
 		return nil, err
 	}
 
+	/* TODO: VFS Error
+	2023/10/04 22:12:16 ERROR : sd.txt: Failed to copy: upload failed to remove old version: move error: Access denied
+	2023/10/04 22:12:16 ERROR : sd.txt: vfs cache: failed to upload try #3, will retry in 40s: vfs cache: failed to transfer file from cache to remote: upload failed to remove old version: move error: Access denied
+	2023/10/04 22:12:36 DEBUG : vfs cache RemoveNotInUse (maxAge=3600000000000, emptyOnly=false): item .sd.txt.swp not removed, freed 0 bytes
+	2023/10/04 22:12:36 DEBUG : vfs cache RemoveNotInUse (maxAge=3600000000000, emptyOnly=false): item sd.txt not removed, freed 0 bytes
+	2023/10/04 22:12:36 INFO  : vfs cache: cleaned: objects 2 (was 2) in use 1, to upload 1, uploading 0, total size 4.955Ki (was 4.955Ki)
+	*/
+
 	absSrc, _ := f.parsePath(src.Remote())
 	absDst, _ := f.parsePath(remote)
 	srcPath, srcName := filepath.Split(absSrc)
@@ -1020,7 +1028,7 @@ func (f *Fs) write(ctx context.Context, dstObj *Object, in io.Reader, src fs.Obj
 		*parentNode,             //Directory
 		fileName,                //Filename
 		src.ModTime(ctx).Unix(), //Modification time
-		"",                      // Temporary directory
+		f.opt.Cache,             // Temporary directory
 		false,                   // Temporary source
 		false,                   // Priority
 		token,                   // Cancel token
@@ -1029,127 +1037,8 @@ func (f *Fs) write(ctx context.Context, dstObj *Object, in io.Reader, src fs.Obj
 	listenerObj.Wait()
 	megaerr := *listenerObj.GetError()
 	if megaerr.GetErrorCode() != mega.MegaErrorAPI_OK {
-		return nil, fmt.Errorf("couldn't upload: %s", megaerr.ToString())
+		return nil, fmt.Errorf("couldn't upload: %d %s", megaerr.GetErrorCode(), megaerr.ToString())
 	}
-
-	/* TODO: Fix some save bug
-	2023/10/04 13:23:02 DEBUG : New Text Document.txt: vfs cache: truncate to size=0 (not needed as size correct)
-	2023/10/04 13:23:02 DEBUG : : Added virtual directory entry vAddFile: "New Text Document.txt"
-	2023/10/04 13:23:02 DEBUG : New Text Document.txt(0xc000c9ca80): >openPending: err=<nil>
-	2023/10/04 13:23:02 DEBUG : New Text Document.txt: vfs cache: cancelling writeback (uploading true) 0xc0009f2d20 item 1
-	2023/10/04 13:23:02 DEBUG : New Text Document.txt: vfs cache: cancelling upload
-
-	It freezes for some reason
-	*/
-
-	/*
-		2023/10/04 13:43:10 DEBUG : New Text Document.txt: vfs cache: starting upload
-		ER2
-		HERE1
-		HERE8
-		fatal error: sync: unlock of unlocked mutex
-		[signal SIGSEGV: segmentation violation code=0x1 addr=0x0 pc=0x1ff31b0]
-
-		goroutine 230 [running]:
-		sync.fatal({0x32d50ab?, 0x0?})
-		        /snap/go/10339/src/runtime/panic.go:1061 +0x18
-		sync.(*Mutex).unlockSlow(0xc000a36108, 0xffffffff)
-		        /snap/go/10339/src/sync/mutex.go:229 +0x35
-		sync.(*Mutex).Unlock(0x0?)
-		        /snap/go/10339/src/sync/mutex.go:223 +0x25
-		panic({0x2e34b60?, 0x4bb04f0?})
-		        /snap/go/10339/src/runtime/panic.go:914 +0x21f
-		github.com/rclone/rclone/backend/meganative.(*Fs).write(0xc000882000, {0x38c3808, 0xc000544a00}, 0xc000651680, {0x38a2960, 0xc000a89600}, {0x7fdff816c4c0, 0xc0009adc80}, 0x1)
-		        /mnt/newfiles/Work/rclone/backend/meganative/meganative.go:989 +0x9d0
-		github.com/rclone/rclone/backend/meganative.(*Object).Update(0xc000651680, {0x38c3808, 0xc000544a00}, {0x38a2960, 0xc000a89600}, {0x7fdff816c4c0, 0xc0009adc80}, {0xc000ac0e30, 0x1, 0x1})
-		        /mnt/newfiles/Work/rclone/backend/meganative/meganative.go:1102 +0xb1
-		github.com/rclone/rclone/fs/operations.Copy({0x38c3808, 0xc000544a00}, {0x38d77a8, 0xc000882000}, {0x38d7818?, 0xc000651680?}, {0xc000d3c16a, 0x15}, {0x38d7578, 0xc0009adc80})
-		        /mnt/newfiles/Work/rclone/fs/operations/operations.go:474 +0x2408
-		github.com/rclone/rclone/vfs/vfscache.(*Item)._store(0xc000a36100, {0x38c3808, 0xc000544a00}, 0xc000ac0b00)
-		        /mnt/newfiles/Work/rclone/vfs/vfscache/item.go:593 +0x1de
-		github.com/rclone/rclone/vfs/vfscache.(*Item).store(0x1a?, {0x38c3808?, 0xc000544a00?}, 0x0?)
-		        /mnt/newfiles/Work/rclone/vfs/vfscache/item.go:629 +0xc6
-		github.com/rclone/rclone/vfs/vfscache.(*Item).Close.func2({0x38c3808?, 0xc000544a00?})
-		        /mnt/newfiles/Work/rclone/vfs/vfscache/item.go:728 +0x2e
-		github.com/rclone/rclone/vfs/vfscache/writeback.(*WriteBack).upload(0xc000ade0e0, {0x38c3808, 0xc000544a00}, 0xc000ade230)
-		        /mnt/newfiles/Work/rclone/vfs/vfscache/writeback/writeback.go:354 +0x128
-		created by github.com/rclone/rclone/vfs/vfscache/writeback.(*WriteBack).processItems in goroutine 229
-		        /mnt/newfiles/Work/rclone/vfs/vfscache/writeback/writeback.go:450 +0x28e
-
-		goroutine 1 [select]:
-		github.com/rclone/rclone/cmd/mountlib.(*MountPoint).Wait(0xc000623980)
-		        /mnt/newfiles/Work/rclone/cmd/mountlib/mount.go:300 +0x265
-		github.com/rclone/rclone/cmd/mountlib.NewMountCommand.func1(0xc000a89700?, {0xc0009ad200?, 0x2, 0x328520c?})
-		        /mnt/newfiles/Work/rclone/cmd/mountlib/mount.go:194 +0x2b8
-		github.com/spf13/cobra.(*Command).execute(0xc000a4ac00, {0xc0009ad1a0, 0x6, 0x6})
-		        /home/niller/go/pkg/mod/github.com/spf13/cobra@v1.7.0/command.go:944 +0x863
-		github.com/spf13/cobra.(*Command).ExecuteC(0x4bd00a0)
-		        /home/niller/go/pkg/mod/github.com/spf13/cobra@v1.7.0/command.go:1068 +0x3a5
-		github.com/spf13/cobra.(*Command).Execute(...)
-		        /home/niller/go/pkg/mod/github.com/spf13/cobra@v1.7.0/command.go:992
-		github.com/rclone/rclone/cmd.Main()
-		        /mnt/newfiles/Work/rclone/cmd/cmd.go:570 +0x71
-		main.main()
-		        /mnt/newfiles/Work/rclone/rclone.go:14 +0xf
-
-		goroutine 17 [syscall, locked to thread]:
-		runtime.goexit()
-		        /snap/go/10339/src/runtime/asm_amd64.s:1650 +0x1
-
-		goroutine 82 [select]:
-		go.opencensus.io/stats/view.(*worker).start(0xc000053000)
-		        /home/niller/go/pkg/mod/go.opencensus.io@v0.24.0/stats/view/worker.go:292 +0x9f
-		created by go.opencensus.io/stats/view.init.0 in goroutine 1
-		        /home/niller/go/pkg/mod/go.opencensus.io@v0.24.0/stats/view/worker.go:34 +0x8d
-
-		goroutine 98 [syscall]:
-		os/signal.signal_recv()
-		        /snap/go/10339/src/runtime/sigqueue.go:152 +0x29
-		os/signal.loop()
-		        /snap/go/10339/src/os/signal/signal_unix.go:23 +0x13
-		created by os/signal.Notify.func1.1 in goroutine 1
-		        /snap/go/10339/src/os/signal/signal.go:151 +0x1f
-
-		goroutine 99 [chan receive]:
-		github.com/rclone/rclone/fs/accounting.(*tokenBucket).startSignalHandler.func1()
-		        /mnt/newfiles/Work/rclone/fs/accounting/accounting_unix.go:25 +0x27
-		created by github.com/rclone/rclone/fs/accounting.(*tokenBucket).startSignalHandler in goroutine 1
-		        /mnt/newfiles/Work/rclone/fs/accounting/accounting_unix.go:22 +0xab
-
-		goroutine 182 [select]:
-		github.com/rclone/rclone/fs/accounting.(*StatsInfo).averageLoop(0xc000994000)
-		        /mnt/newfiles/Work/rclone/fs/accounting/stats.go:332 +0x166
-		created by github.com/rclone/rclone/fs/accounting.(*StatsInfo).startAverageLoop.func1 in goroutine 181
-		        /mnt/newfiles/Work/rclone/fs/accounting/stats.go:361 +0x69
-
-		goroutine 96 [syscall]:
-		syscall.Syscall(0x122fcc5?, 0x4bbf500?, 0x11bbac5?, 0x2f242c0?)
-		        /snap/go/10339/src/syscall/syscall_linux.go:69 +0x25
-		syscall.read(0x4bbf500?, {0xc000c42000?, 0x4?, 0xc0009d7400?})
-		        /snap/go/10339/src/syscall/zsyscall_linux_amd64.go:721 +0x38
-		syscall.Read(...)
-		        /snap/go/10339/src/syscall/syscall_unix.go:181
-		bazil.org/fuse.(*Conn).ReadRequest(0xc0009ad680)
-		        /home/niller/go/pkg/mod/bazil.org/fuse@v0.0.0-20221209211307-2abb8038c751/fuse.go:582 +0xce
-		bazil.org/fuse/fs.(*Server).Serve(0xc00099e0e0, {0x38a29c0?, 0xc00097ade0})
-		        /home/niller/go/pkg/mod/bazil.org/fuse@v0.0.0-20221209211307-2abb8038c751/fs/serve.go:504 +0x385
-		github.com/rclone/rclone/cmd/mount.mount.func2()
-		        /mnt/newfiles/Work/rclone/cmd/mount/mount.go:101 +0x34
-		created by github.com/rclone/rclone/cmd/mount.mount in goroutine 1
-		        /mnt/newfiles/Work/rclone/cmd/mount/mount.go:100 +0x3d0
-
-		goroutine 97 [chan receive]:
-		github.com/rclone/rclone/lib/atexit.Register.func1.1()
-		        /mnt/newfiles/Work/rclone/lib/atexit/atexit.go:45 +0x29
-		created by github.com/rclone/rclone/lib/atexit.Register.func1 in goroutine 1
-		        /mnt/newfiles/Work/rclone/lib/atexit/atexit.go:44 +0x68
-
-		goroutine 93 [select]:
-		github.com/rclone/rclone/vfs/vfscache.(*Cache).cleaner(0xc000a404b0, {0x38c3808, 0xc000ace140})
-		        /mnt/newfiles/Work/rclone/vfs/vfscache/cache.go:836 +0x15c
-		created by github.com/rclone/rclone/vfs/vfscache.New in goroutine 1
-		        /mnt/newfiles/Work/rclone/vfs/vfscache/cache.go:145 +0x6db
-	*/
 
 	// Delete old node
 	if dstObj.info != nil {

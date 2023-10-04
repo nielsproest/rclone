@@ -23,11 +23,6 @@ func (l *MyMegaListener) OnRequestFinish(api mega.MegaApi, request mega.MegaRequ
 	l.request = &req
 	l.err = &err
 
-	if err.GetErrorCode() != mega.MegaErrorAPI_OK {
-		fmt.Printf("INFO: Request finished with error\n")
-		return
-	}
-
 	l.m.Lock()
 	defer l.m.Unlock()
 
@@ -41,6 +36,11 @@ func (l *MyMegaListener) OnRequestFinish(api mega.MegaApi, request mega.MegaRequ
 
 	l.notified = true
 	l.cv.Broadcast()
+
+	if err.GetErrorCode() != mega.MegaErrorAPI_OK {
+		fmt.Printf("INFO: Request finished with error\n")
+		return
+	}
 }
 
 func (l *MyMegaListener) OnNodesUpdate(api mega.MegaApi, nodes mega.MegaNodeList) {
