@@ -669,6 +669,7 @@ func (b *BufferedReaderCloser) Read(p []byte) (n int, err error) {
 
 	n = copy(p, b.buffer)
 	b.buffer = b.buffer[n:]
+
 	return n, nil
 }
 
@@ -698,6 +699,7 @@ func (b *BufferedReaderCloser) WriteToBuffer(data []byte) error {
 	if b.closed {
 		return io.ErrClosedPipe
 	}
+	// TODO: Use a better buffer with pre-allocation and wait if full
 	b.buffer = append(b.buffer, data...)
 
 	return nil
@@ -707,10 +709,7 @@ func (b *BufferedReaderCloser) EOF() {
 	defer b.bufferMu.Unlock()
 
 	fmt.Printf("FILE EOF\n")
-	/*if !b.closed {
-		close(b.closeCh)
-		b.closed = true
-	}*/
+	// TODO: Do something here
 }
 
 // Open implements fs.Object.
