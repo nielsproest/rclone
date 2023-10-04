@@ -24,6 +24,19 @@ import (
 )
 
 /*
+ * Stuff left to do:
+ * Resolve all TODO's.
+ * Test all functionality (use rclone test functions also).
+ * Remove the dozen of debug calls (or make them proper debug calls with the debug fs flag),
+ * actually i should find if MEGA has optional debug flags i can set.
+ * Potentially find a better upload method.
+ *
+ * But most importantly at the end:
+ * Find a way to ship this thing
+ */
+
+/*
+ * MEGA-SDK Path info:
  * The path separator character is '/'
  * The Root node is /
  * The Vault root node is //in/
