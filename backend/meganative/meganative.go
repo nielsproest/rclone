@@ -171,9 +171,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	}
 
 	// Used for api calls, not transfers
-	listenerObj := MyMegaListener{}
-	listenerObj.cv = sync.NewCond(&listenerObj.m)
-	listener := mega.NewDirectorMegaRequestListener(&listenerObj)
+	listenerObj, listener := getRequestListener()
 
 	// TODO: Generate code at: https://mega.co.nz/#sdk
 	srv := mega.NewMegaApi(
@@ -221,7 +219,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		root:      root,
 		opt:       *opt,
 		srv:       &srv,
-		srvListen: &listenerObj,
+		srvListen: listenerObj,
 	}
 	f.features = (&fs.Features{
 		DuplicateFiles:          true,
@@ -319,10 +317,22 @@ func (f *Fs) findObject(file string) (*mega.MegaNode, error) {
 	return &n, nil
 }
 
-func (f *Fs) hardDelete(node mega.MegaNode) error {
+func getRequestListener() (*MyMegaListener, mega.MegaRequestListener) {
 	listenerObj := MyMegaListener{}
 	listenerObj.cv = sync.NewCond(&listenerObj.m)
 	listener := mega.NewDirectorMegaRequestListener(&listenerObj)
+	return &listenerObj, listener
+}
+func getTransferListener() (*MyMegaTransferListener, mega.MegaTransferListener) {
+	listenerObj := MyMegaTransferListener{}
+	listenerObj.cv = sync.NewCond(&listenerObj.m)
+	listener := mega.NewDirectorMegaTransferListener(&listenerObj)
+	listenerObj.director = &listener
+	return &listenerObj, listener
+}
+
+func (f *Fs) hardDelete(node mega.MegaNode) error {
+	listenerObj, listener := getRequestListener()
 	defer mega.DeleteDirectorMegaRequestListener(listener)
 
 	listenerObj.Reset()
@@ -352,9 +362,7 @@ func (f *Fs) delete(node mega.MegaNode) error {
 }
 
 func (f *Fs) moveNode(node mega.MegaNode, dir mega.MegaNode) error {
-	listenerObj := MyMegaListener{}
-	listenerObj.cv = sync.NewCond(&listenerObj.m)
-	listener := mega.NewDirectorMegaRequestListener(&listenerObj)
+	listenerObj, listener := getRequestListener()
 	defer mega.DeleteDirectorMegaRequestListener(listener)
 
 	listenerObj.Reset()
@@ -370,9 +378,7 @@ func (f *Fs) moveNode(node mega.MegaNode, dir mega.MegaNode) error {
 }
 
 func (f *Fs) renameNode(node mega.MegaNode, name string) error {
-	listenerObj := MyMegaListener{}
-	listenerObj.cv = sync.NewCond(&listenerObj.m)
-	listener := mega.NewDirectorMegaRequestListener(&listenerObj)
+	listenerObj, listener := getRequestListener()
 	defer mega.DeleteDirectorMegaRequestListener(listener)
 
 	listenerObj.Reset()
@@ -396,9 +402,7 @@ func (f *Fs) rootFix() error {
 			return fs.ErrorDirNotFound
 		}
 
-		listenerObj := MyMegaListener{}
-		listenerObj.cv = sync.NewCond(&listenerObj.m)
-		listener := mega.NewDirectorMegaRequestListener(&listenerObj)
+		listenerObj, listener := getRequestListener()
 		defer mega.DeleteDirectorMegaRequestListener(listener)
 
 		// Create folder
@@ -479,9 +483,7 @@ func (f *Fs) mkdir(name string, parent *mega.MegaNode) (*mega.MegaNode, error) {
 		return nil, err
 	}
 
-	listenerObj := MyMegaListener{}
-	listenerObj.cv = sync.NewCond(&listenerObj.m)
-	listener := mega.NewDirectorMegaRequestListener(&listenerObj)
+	listenerObj, listener := getRequestListener()
 	defer mega.DeleteDirectorMegaRequestListener(listener)
 
 	// Create folder
@@ -652,92 +654,43 @@ func (f *Fs) Rmdir(ctx context.Context, dir string) error {
 // ------------------------------------------------------------
 
 // BufferedReaderCloser is a custom type that implements io.ReaderCloser
-/*type BufferedReaderCloser struct {
-	buffer   chan []byte
-	bufferMu sync.Mutex
-	closed   bool
-	obj      *Object
-	listener *MyMegaTransferListener
-}
-
-// NewBufferedReaderCloser creates a new BufferedReaderCloser with a specified buffer size.
-func NewBufferedReaderCloser(bufferSize int) *BufferedReaderCloser {
-	return &BufferedReaderCloser{
-		buffer: make(chan []byte, bufferSize),
-		closed: false,
-	}
-}
-
-// Read reads data from the buffer.
-func (b *BufferedReaderCloser) Read(p []byte) (n int, err error) {
-	select {
-	case data, ok := <-b.buffer:
-		if !ok {
-			return 0, fmt.Errorf("read on closed file")
-		}
-		n = copy(p, data)
-		return n, nil
-	}
-}
-
-// Close closes the BufferedReaderCloser.
-func (b *BufferedReaderCloser) Close() error {
-	b.bufferMu.Lock()
-	defer b.bufferMu.Unlock()
-
-	fmt.Printf("FILE CLOSE\n")
-
-	// Ask Mega kindly to stop
-	transfer := b.listener.GetTransfer()
-	if transfer != nil {
-		b.obj.fs.API().CancelTransfer(*transfer)
-	}
-	defer mega.DeleteDirectorMegaTransferListener(*b.listener.director)
-
-	if !b.closed {
-		close(b.buffer)
-		b.closed = true
-	}
-
-	return nil
-}
-
-// WriteToBuffer writes data to the buffer.
-func (b *BufferedReaderCloser) WriteToBuffer(data []byte) error {
-	b.bufferMu.Lock()
-	defer b.bufferMu.Unlock()
-
-	if b.closed {
-		return io.ErrClosedPipe
-	}
-
-	// Block if the buffer is full
-	b.buffer <- data
-
-	return nil
-}
-func (b *BufferedReaderCloser) EOF() {
-	b.bufferMu.Lock()
-	defer b.bufferMu.Unlock()
-
-	fmt.Printf("FILE EOF\n")
-	b.closed = true
-}*/
-
-// BufferedReaderCloser is a custom type that implements io.ReaderCloser
 type BufferedReaderCloser struct {
-	buffer   []byte
-	bufferMu sync.Mutex
-	closed   bool
-	obj      *Object
-	listener *MyMegaTransferListener
+	buffer     []byte
+	bufferSize int
+	bufferMu   sync.Mutex
+	closed     bool
+	obj        *Object
+	listener   *MyMegaTransferListener
 }
 
 // NewBufferedReaderCloser creates a new BufferedReaderCloser with a specified buffer size.
 func NewBufferedReaderCloser(bufferSize int) *BufferedReaderCloser {
 	return &BufferedReaderCloser{
-		buffer: []byte{},
-		closed: false,
+		buffer:     []byte{},
+		bufferSize: bufferSize,
+		closed:     false,
+	}
+}
+
+// Check if the buffer size exceeds double the bufferSize
+func (b *BufferedReaderCloser) CheckExceeds() {
+	_transfer := b.listener.GetTransfer()
+	if _transfer != nil {
+		transfer := *_transfer
+		if transfer.GetState() == mega.MegaTransferSTATE_ACTIVE && len(b.buffer) > 2*b.bufferSize {
+			b.obj.fs.setPause(transfer, true)
+		}
+	}
+}
+
+// Check if the buffer size is less or equal to the buffer size
+func (b *BufferedReaderCloser) CheckLess() {
+	_transfer := b.listener.GetTransfer()
+	if _transfer != nil {
+		transfer := *_transfer
+		if transfer.GetState() == mega.MegaTransferSTATE_PAUSED && len(b.buffer) <= b.bufferSize {
+			b.obj.fs.setPause(transfer, false)
+		}
 	}
 }
 
@@ -756,6 +709,7 @@ func (b *BufferedReaderCloser) Read(p []byte) (n int, err error) {
 
 	n = copy(p, b.buffer)
 	b.buffer = b.buffer[n:]
+	b.CheckLess()
 
 	return n, nil
 }
@@ -778,6 +732,22 @@ func (b *BufferedReaderCloser) Close() error {
 	return nil
 }
 
+func (f *Fs) setPause(signal mega.MegaTransfer, paused bool) error {
+	listenerObj, listener := getRequestListener()
+	defer mega.DeleteDirectorMegaRequestListener(listener)
+
+	listenerObj.Reset()
+	f.API().PauseTransfer(signal, paused, listener)
+	listenerObj.Wait()
+
+	megaerr := *listenerObj.GetError()
+	if megaerr.GetErrorCode() != mega.MegaErrorAPI_OK {
+		return fmt.Errorf("MEGA SetPause root Error: %s", megaerr.ToString())
+	}
+
+	return nil
+}
+
 // WriteToBuffer writes data to the buffer.
 func (b *BufferedReaderCloser) WriteToBuffer(data []byte) error {
 	b.bufferMu.Lock()
@@ -786,8 +756,8 @@ func (b *BufferedReaderCloser) WriteToBuffer(data []byte) error {
 	if b.closed {
 		return io.ErrClosedPipe
 	}
-	// TODO: Use a better buffer with pre-allocation and wait if full
 	b.buffer = append(b.buffer, data...)
+	b.CheckExceeds()
 
 	return nil
 }
@@ -826,17 +796,15 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 	if 0 > limit || limit+offset > o.Size() {
 		limit = o.Size() - offset
 	}
-	// Create listener
-	listenerObj := MyMegaTransferListener{}
-	listenerObj.cv = sync.NewCond(&listenerObj.m)
-	listener := mega.NewDirectorMegaTransferListener(&listenerObj)
-	listenerObj.director = &listener
 
-	// 1MB buffer
-	reader := NewBufferedReaderCloser(1024 * 1024)
+	// Create listener
+	listenerObj, listener := getTransferListener()
+
+	// 5MB buffer
+	reader := NewBufferedReaderCloser(1024 * 1024 * 5)
 	listenerObj.out = reader
 	reader.obj = o
-	reader.listener = &listenerObj
+	reader.listener = listenerObj
 
 	// TODO: If listener.notified then its stopped, detect this
 	listenerObj.Reset()
@@ -1013,7 +981,7 @@ func (f *Fs) write(ctx context.Context, dstObj *Object, in io.Reader, src fs.Obj
 	}
 
 	// Create a temporary file
-	tempFile, err := os.CreateTemp("", "mega*.tmp")
+	tempFile, err := os.CreateTemp(f.opt.Cache, "mega*.tmp")
 	if err != nil {
 		return dstObj, fmt.Errorf("failed to create temporary file")
 	}
@@ -1025,10 +993,10 @@ func (f *Fs) write(ctx context.Context, dstObj *Object, in io.Reader, src fs.Obj
 	if err != nil {
 		return dstObj, fmt.Errorf("failed to write temporary file")
 	}
+	// TODO: Can we create a temporary file device?
+	// Probably not cross platform
 
-	listenerObj := MyMegaTransferListener{}
-	listenerObj.cv = sync.NewCond(&listenerObj.m)
-	listener := mega.NewDirectorMegaTransferListener(&listenerObj)
+	listenerObj, listener := getTransferListener()
 	defer mega.DeleteDirectorMegaTransferListener(listener)
 
 	token := mega.MegaCancelTokenCreateInstance()
