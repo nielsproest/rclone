@@ -8,6 +8,7 @@ import (
 
 type BufferWriter interface {
 	WriteToBuffer(data []byte) error
+	EOF()
 }
 
 type MyMegaTransferListener struct {
@@ -37,6 +38,8 @@ func (l *MyMegaTransferListener) OnTransferFinish(api mega.MegaApi, transfer meg
 
 	l.notified = true
 	l.cv.Broadcast()
+
+	l.out.EOF()
 }
 
 func (l *MyMegaTransferListener) OnTransferData(api mega.MegaApi, transfer mega.MegaTransfer, buffer string, size int64) bool {

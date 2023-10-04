@@ -257,8 +257,8 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 // Support functions
 
 // parsePath parses a mega 'url'
-func (f *Fs) parsePath(path string) (string, mega.MegaNode) {
-	return strings.Trim(path, "/"), *f._rootNode
+func (f *Fs) parsePath(path string) (string, *mega.MegaNode) {
+	return strings.Trim(path, "/"), f._rootNode
 }
 
 // Converts any mega unix time to time.Time
@@ -271,14 +271,32 @@ func (f *Fs) API() mega.MegaApi {
 	return *f.srv
 }
 
+func (f *Fs) getObject(dir string) (mega.MegaNode, error) {
+	trimmedDir, _rootNode := f.parsePath(dir)
+	if _rootNode == nil || (*_rootNode).Swigcptr() == 0 {
+		return nil, fmt.Errorf("root not found")
+	}
+
+	node := f.API().GetNodeByPath(trimmedDir, *_rootNode)
+	if node.Swigcptr() == 0 {
+		return nil, fs.ErrorObjectNotFound
+	}
+
+	return node, nil
+}
+
 // findDir finds the directory rooted from the node passed in
 func (f *Fs) findDir(dir string) (*mega.MegaNode, error) {
 	//fmt.Printf("HERE7 %s\n", f.parsePath(dir))
-	n := f.API().GetNodeByPath(f.parsePath(dir))
-	if n.Swigcptr() == 0 {
-		fmt.Printf("G1\n")
-		return nil, fs.ErrorDirNotFound
-	} else if n.Swigcptr() != 0 && n.GetType() == mega.MegaNodeTYPE_FILE {
+	n, err := f.getObject(dir)
+	if err != nil {
+		if err == fs.ErrorObjectNotFound {
+			err = fs.ErrorDirNotFound
+		}
+		return nil, err
+	}
+
+	if n.Swigcptr() != 0 && n.GetType() == mega.MegaNodeTYPE_FILE {
 		fmt.Printf("G2\n")
 		return nil, fs.ErrorIsFile
 	}
@@ -289,10 +307,12 @@ func (f *Fs) findDir(dir string) (*mega.MegaNode, error) {
 // findObject looks up the node for the object of the name given
 func (f *Fs) findObject(file string) (*mega.MegaNode, error) {
 	fmt.Printf("HERE8\n")
-	n := f.API().GetNodeByPath(f.parsePath(file))
-	if n.Swigcptr() == 0 {
-		return nil, fs.ErrorObjectNotFound
-	} else if n.Swigcptr() != 0 && n.GetType() != mega.MegaNodeTYPE_FILE {
+	n, err := f.getObject(file)
+	if err != nil {
+		return nil, err
+	}
+
+	if n.Swigcptr() != 0 && n.GetType() != mega.MegaNodeTYPE_FILE {
 		return nil, fs.ErrorIsDir
 	}
 	return &n, nil
@@ -304,9 +324,9 @@ func (f *Fs) hardDelete(node mega.MegaNode) error {
 	listener := mega.NewDirectorMegaRequestListener(&listenerObj)
 	defer mega.DeleteDirectorMegaRequestListener(listener)
 
+	listenerObj.Reset()
 	f.API().Remove(node, listener)
 	listenerObj.Wait()
-	defer listenerObj.Reset()
 
 	megaerr := *listenerObj.GetError()
 	if megaerr.GetErrorCode() != mega.MegaErrorAPI_OK {
@@ -336,9 +356,9 @@ func (f *Fs) moveNode(node mega.MegaNode, dir mega.MegaNode) error {
 	listener := mega.NewDirectorMegaRequestListener(&listenerObj)
 	defer mega.DeleteDirectorMegaRequestListener(listener)
 
+	listenerObj.Reset()
 	f.API().MoveNode(node, dir, listener)
 	listenerObj.Wait()
-	defer listenerObj.Reset()
 
 	megaerr := *listenerObj.GetError()
 	if megaerr.GetErrorCode() != mega.MegaErrorAPI_OK {
@@ -354,9 +374,9 @@ func (f *Fs) renameNode(node mega.MegaNode, name string) error {
 	listener := mega.NewDirectorMegaRequestListener(&listenerObj)
 	defer mega.DeleteDirectorMegaRequestListener(listener)
 
+	listenerObj.Reset()
 	f.API().RenameNode(node, name, listener)
 	listenerObj.Wait()
-	defer listenerObj.Reset()
 
 	megaerr := *listenerObj.GetError()
 	if megaerr.GetErrorCode() != mega.MegaErrorAPI_OK {
@@ -366,9 +386,52 @@ func (f *Fs) renameNode(node mega.MegaNode, name string) error {
 	return nil
 }
 
+// In the original mega.go, this is called in mkdir
+func (f *Fs) rootFix() error {
+	if f._rootNode == nil {
+		root, rootName := filepath.Split(f.root)
+		rootNode := f.API().GetNodeByPath(root)
+		if rootNode.Swigcptr() == 0 {
+			return fs.ErrorDirNotFound
+		}
+
+		listenerObj := MyMegaListener{}
+		listenerObj.cv = sync.NewCond(&listenerObj.m)
+		listener := mega.NewDirectorMegaRequestListener(&listenerObj)
+		defer mega.DeleteDirectorMegaRequestListener(listener)
+
+		// Create folder
+		listenerObj.Reset()
+		f.API().CreateFolder(rootName, rootNode, listener)
+		listenerObj.Wait()
+
+		megaerr := *listenerObj.GetError()
+		if megaerr.GetErrorCode() != mega.MegaErrorAPI_OK {
+			return fmt.Errorf("MEGA Mkdir root Error: %s", megaerr.ToString())
+		}
+
+		rootNode = f.API().GetNodeByPath(f.root)
+		if rootNode.Swigcptr() == 0 {
+			return fmt.Errorf("root dir created but non-existant")
+		}
+
+		f._rootNode = &rootNode
+	}
+	return nil
+}
+
 // Make parent directory and return it
 func (f *Fs) mkdirParent(path string) (*mega.MegaNode, error) {
-	path, rootNode := f.parsePath(path)
+	err := f.rootFix()
+	if err != nil {
+		return nil, err
+	}
+
+	path, _rNode := f.parsePath(path)
+	if _rNode == nil {
+		return nil, fmt.Errorf("root not found")
+	}
+	rootNode := *_rNode
 
 	// If parent dir exists
 	_root, _ := filepath.Split(path)
@@ -407,15 +470,20 @@ func (f *Fs) iterChildren(node mega.MegaNode) (<-chan mega.MegaNode, error) {
 
 // Make directory and return it
 func (f *Fs) mkdir(name string, parent *mega.MegaNode) (*mega.MegaNode, error) {
+	err := f.rootFix()
+	if err != nil {
+		return nil, err
+	}
+
 	listenerObj := MyMegaListener{}
 	listenerObj.cv = sync.NewCond(&listenerObj.m)
 	listener := mega.NewDirectorMegaRequestListener(&listenerObj)
 	defer mega.DeleteDirectorMegaRequestListener(listener)
 
 	// Create folder
+	listenerObj.Reset()
 	f.API().CreateFolder(name, parent, listener)
 	listenerObj.Wait()
-	defer listenerObj.Reset()
 
 	megaerr := *listenerObj.GetError()
 	if megaerr.GetErrorCode() != mega.MegaErrorAPI_OK {
@@ -498,19 +566,25 @@ func (f *Fs) Mkdir(ctx context.Context, dir string) error {
 
 // NewObject implements fs.Fs.
 func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
-	fmt.Printf("HERE3\n")
+	fmt.Printf("HERE3 %s\n", remote)
 	o := &Object{
 		fs:     f,
 		remote: remote,
 	}
 
-	var err error
-	n := f.API().GetNodeByPath(f.parsePath(remote))
-	if n.Swigcptr() != 0 {
-		o.info = &n
-	} else {
-		err = fs.ErrorObjectNotFound
+	_, err := f.mkdirParent(remote)
+	if err != nil && err != fs.ErrorDirExists {
+		fmt.Printf("BUGG1 %s\n", err.Error())
+		return o, err
 	}
+
+	n, err := f.getObject(remote)
+	if err != nil {
+		fmt.Printf("BUGG2\n")
+		return o, err
+	}
+
+	o.info = &n
 
 	return o, err
 }
@@ -525,7 +599,7 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options .
 	fmt.Printf("HERE11\n")
 	existingObj, err := f.findObject(src.Remote())
 	if err != nil {
-		return f.PutUnchecked(ctx, in, src)
+		return f.PutUnchecked(ctx, in, src, options...)
 	}
 
 	o := &Object{
@@ -586,6 +660,7 @@ func NewBufferedReaderCloser(bufferSize int) *BufferedReaderCloser {
 
 // Read reads data from the buffer.
 func (b *BufferedReaderCloser) Read(p []byte) (n int, err error) {
+	// TODO: Do we EOF because MEGA is faster than us?
 	select {
 	case data := <-b.readCh:
 		n = copy(p, data)
@@ -598,6 +673,9 @@ func (b *BufferedReaderCloser) Read(p []byte) (n int, err error) {
 // Close closes the BufferedReaderCloser.
 func (b *BufferedReaderCloser) Close() error {
 	b.bufferMu.Lock()
+	defer b.bufferMu.Unlock()
+
+	fmt.Printf("FILE CLOSE\n")
 
 	// Ask Mega kindly to stop
 	b.obj.fs.API().CancelTransfer(*b.listener.GetTransfer())
@@ -607,25 +685,32 @@ func (b *BufferedReaderCloser) Close() error {
 		close(b.closeCh)
 		b.closed = true
 	}
-	b.bufferMu.Unlock()
 	return nil
 }
 
 // WriteToBuffer writes data to the buffer.
 func (b *BufferedReaderCloser) WriteToBuffer(data []byte) error {
 	b.bufferMu.Lock()
+	defer b.bufferMu.Unlock()
+
 	if b.closed {
-		b.bufferMu.Unlock()
 		return io.ErrClosedPipe
 	}
 	copy(b.buffer, data)
 	b.readCh <- b.buffer
-	b.bufferMu.Unlock()
 	return nil
+}
+func (b *BufferedReaderCloser) EOF() {
+	b.bufferMu.Lock()
+	defer b.bufferMu.Unlock()
+
+	fmt.Printf("FILE EOF\n")
+	b.closeCh <- struct{}{}
 }
 
 // Open implements fs.Object.
 func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadCloser, error) {
+	fmt.Printf("FILE OPEN\n")
 	var offset, limit int64 = 0, -1
 	for _, option := range options {
 		switch x := option.(type) {
@@ -641,8 +726,8 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 	}
 
 	// Bigger than file limit
-	if 0 > limit || limit+offset > (*o.info).GetSize() {
-		limit = (*o.info).GetSize() - offset
+	if 0 > limit || limit+offset > o.Size() {
+		limit = o.Size() - offset
 	}
 
 	// Create listener
@@ -651,12 +736,77 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 	listener := mega.NewDirectorMegaTransferListener(&listenerObj)
 	listenerObj.director = &listener
 
-	// 1MB buffer
-	reader := NewBufferedReaderCloser(1024 * 1024)
+	// 1KB buffer
+	reader := NewBufferedReaderCloser(1024)
 	listenerObj.out = reader
 	reader.obj = o
 	reader.listener = &listenerObj
 
+	/*
+		// TODO: Fix deletion bug that empties files
+		2023/10/04 13:40:26 DEBUG : New Text Document.txt: >Open: fh=&{New Text Document.txt (rw)}, err=<nil>
+		2023/10/04 13:40:26 DEBUG : &{New Text Document.txt (rw)}: Read: len=77824, offset=0
+		2023/10/04 13:40:26 DEBUG : New Text Document.txt(0xc000e08380): _readAt: size=77824, off=0
+		2023/10/04 13:40:26 DEBUG : New Text Document.txt(0xc000e08380): openPending:
+		HERE4
+		test2
+		2023/10/04 13:40:26 DEBUG : New Text Document.txt: vfs cache: checking remote fingerprint "0,2023-10-04 11:30:35 +0000 UTC" against cached fingerprint "29,2023-10-04 11:30:35 +0000 UTC"
+		2023/10/04 13:40:26 DEBUG : New Text Document.txt: vfs cache: remote object has changed but local object modified - keeping it (remote fingerprint "0,2023-10-04 11:30:35 +0000 UTC" != cached fingerprint "29,2023-10-04 11:30:35 +0000 UTC")
+		HERE4
+		2023/10/04 13:40:26 DEBUG : New Text Document.txt: vfs cache: truncate to size=75195 (not needed as size correct)
+		2023/10/04 13:40:26 INFO  : New Text Document.txt: vfs cache: removed cache file as item.open failed on _createFile, remove cache data/metadata files
+		2023/10/04 13:40:26 DEBUG : New Text Document.txt: vfs cache: removed metadata from cache as item.open failed on _createFile, remove cache data/metadata files
+		2023/10/04 13:40:26 ERROR : New Text Document.txt: vfs cache: failed to open item: vfs cache item: create cache file failed: vfs cache item: internal error: didn't Close file
+		2023/10/04 13:40:26 ERROR : New Text Document.txt: Non-out-of-space error encountered during open
+		2023/10/04 13:40:26 DEBUG : New Text Document.txt(0xc000e08380): >openPending: err=open RW handle failed to open cache file: vfs cache item: create cache file failed: vfs cache item: internal error: didn't Close file
+		2023/10/04 13:40:26 DEBUG : New Text Document.txt(0xc000e08380): >_readAt: n=0, err=open RW handle failed to open cache file: vfs cache item: create cache file failed: vfs cache item: internal error: didn't Close file
+		2023/10/04 13:40:26 ERROR : IO error: open RW handle failed to open cache file: vfs cache item: create cache file failed: vfs cache item: internal error: didn't Close file
+		2023/10/04 13:40:26 DEBUG : &{New Text Document.txt (rw)}: >Read: read=0, err=open RW handle failed to open cache file: vfs cache item: create cache file failed: vfs cache item: internal error: didn't Close file
+		2023/10/04 13:40:26 DEBUG : &{New Text Document.txt (rw)}: Read: len=4096, offset=0
+		2023/10/04 13:40:26 DEBUG : New Text Document.txt(0xc000e08380): _readAt: size=4096, off=0
+		HERE4
+		2023/10/04 13:40:26 DEBUG : New Text Document.txt(0xc000e08380): >_readAt: n=0, err=EOF
+	*/
+
+	/* TODO: Reader freezes
+	2023/10/04 14:03:22 DEBUG : New Text Document.txt: Open: flags=OpenReadOnly+OpenNonblock
+	2023/10/04 14:03:22 DEBUG : New Text Document.txt: Open: flags=O_RDONLY|0x800
+	2023/10/04 14:03:22 DEBUG : New Text Document.txt: newRWFileHandle:
+	2023/10/04 14:03:22 DEBUG : New Text Document.txt: >newRWFileHandle: err=<nil>
+	2023/10/04 14:03:22 DEBUG : New Text Document.txt: >Open: fd=New Text Document.txt (rw), err=<nil>
+	HERE4
+	2023/10/04 14:03:22 DEBUG : New Text Document.txt: >Open: fh=&{New Text Document.txt (rw)}, err=<nil>
+	2023/10/04 14:03:22 DEBUG : &{New Text Document.txt (rw)}: Read: len=77824, offset=0
+	2023/10/04 14:03:22 DEBUG : New Text Document.txt(0xc0003fed00): _readAt: size=77824, off=0
+	2023/10/04 14:03:22 DEBUG : New Text Document.txt(0xc0003fed00): openPending:
+	HERE4
+	test2
+	2023/10/04 14:03:22 DEBUG : New Text Document.txt: vfs cache: checking remote fingerprint "75195,2023-10-04 11:42:07 +0000 UTC" against cached fingerprint "75195,2023-10-04 11:42:07 +0000 UTC"
+	HERE4
+	2023/10/04 14:03:22 DEBUG : New Text Document.txt: vfs cache: truncate to size=75195 (not needed as size correct)
+	2023/10/04 14:03:22 DEBUG : : Added virtual directory entry vAddFile: "New Text Document.txt"
+	2023/10/04 14:03:22 DEBUG : New Text Document.txt(0xc0003fed00): >openPending: err=<nil>
+	2023/10/04 14:03:22 DEBUG : vfs cache: looking for range={Pos:0 Size:75195} in [] - present false
+	HERE4
+	HERE4
+	test3
+	2023/10/04 14:03:22 DEBUG : New Text Document.txt: ChunkedReader.RangeSeek from -1 to 0 length -1
+	HERE4
+	test3
+	2023/10/04 14:03:22 DEBUG : New Text Document.txt: ChunkedReader.Read at -1 length 32768 chunkOffset 0 chunkSize 134217728
+	test3
+	2023/10/04 14:03:22 DEBUG : New Text Document.txt: ChunkedReader.openRange at 0 length 134217728
+	FILE OPEN
+	HERE4
+	HERE4
+	HERE4
+	FILE EOF
+	FILE CLOSE
+	HERE4
+	HERE4
+	test3
+	INFO: Request finished with error
+	*/
 	// TODO: If listener.notified then its stopped, detect this
 	o.fs.API().StartStreaming(*o.info, offset, limit, listener)
 
@@ -665,17 +815,21 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 
 // ------------------------------------------------------------
 
-// Remove implements fs.Object.
+// Purge all files in the directory specified
+//
+// Implement this if you have a way of deleting all the files
+// quicker than just running Remove() on the result of List()
+//
+// Return an error if it doesn't exist
 func (o *Object) Remove(ctx context.Context) error {
-	fmt.Printf("PATH3")
+	fmt.Printf("PATH3\n")
 	if o.info == nil {
-		return fmt.Errorf("file not found")
+		return fs.ErrorObjectNotFound
 	}
-
 	n := *o.info
 
 	if !n.IsFile() {
-		return fmt.Errorf("the path isn't a file")
+		return fs.ErrorIsDir
 	}
 
 	if err := o.fs.delete(n); err != nil {
@@ -701,7 +855,7 @@ func (f *Fs) Purge(ctx context.Context, dir string) error {
 	}
 
 	if !(*n).IsFolder() {
-		return fmt.Errorf("the path isn't a folder")
+		return fs.ErrorIsFile
 	}
 
 	/*if c := (*n).GetChildren(); c.Swigcptr() != 0 || c.Size() > 0 {
@@ -817,14 +971,10 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 	return nil
 }
 
-func (f *Fs) write(ctx context.Context, dstObj *Object, in io.Reader, src fs.ObjectInfo, ignoreExist bool) (*Object, error) {
+func (f *Fs) write(ctx context.Context, dstObj *Object, in io.Reader, src fs.ObjectInfo) (*Object, error) {
 	fmt.Printf("HERE1\n")
-	node, err := f.findObject(dstObj.remote)
-	if err != nil && !ignoreExist {
-		return dstObj, err
-	}
 
-	pnode, err := f.mkdirParent(dstObj.remote)
+	parentNode, err := f.mkdirParent(dstObj.remote)
 	if err != nil && err != fs.ErrorDirExists {
 		fs.Debugf(f, "Parent folder creation failed")
 		return nil, err
@@ -854,9 +1004,10 @@ func (f *Fs) write(ctx context.Context, dstObj *Object, in io.Reader, src fs.Obj
 
 	_, fileName := filepath.Split(dstObj.remote)
 	// Somebody contact MEGA, ask them for a upload chunks interface :P
+	listenerObj.Reset()
 	f.API().StartUpload(
 		tempFile.Name(),         //Localpath
-		*pnode,                  //Directory
+		*parentNode,             //Directory
 		fileName,                //Filename
 		src.ModTime(ctx).Unix(), //Modification time
 		"",                      // Temporary directory
@@ -866,13 +1017,138 @@ func (f *Fs) write(ctx context.Context, dstObj *Object, in io.Reader, src fs.Obj
 		listener,                //Listener
 	)
 	listenerObj.Wait()
-	defer listenerObj.Reset()
+	/* TODO: Fix some save bug
+	2023/10/04 13:23:02 DEBUG : New Text Document.txt: vfs cache: truncate to size=0 (not needed as size correct)
+	2023/10/04 13:23:02 DEBUG : : Added virtual directory entry vAddFile: "New Text Document.txt"
+	2023/10/04 13:23:02 DEBUG : New Text Document.txt(0xc000c9ca80): >openPending: err=<nil>
+	2023/10/04 13:23:02 DEBUG : New Text Document.txt: vfs cache: cancelling writeback (uploading true) 0xc0009f2d20 item 1
+	2023/10/04 13:23:02 DEBUG : New Text Document.txt: vfs cache: cancelling upload
+
+	It freezes for some reason
+	*/
+
+	/*
+		2023/10/04 13:43:10 DEBUG : New Text Document.txt: vfs cache: starting upload
+		ER2
+		HERE1
+		HERE8
+		fatal error: sync: unlock of unlocked mutex
+		[signal SIGSEGV: segmentation violation code=0x1 addr=0x0 pc=0x1ff31b0]
+
+		goroutine 230 [running]:
+		sync.fatal({0x32d50ab?, 0x0?})
+		        /snap/go/10339/src/runtime/panic.go:1061 +0x18
+		sync.(*Mutex).unlockSlow(0xc000a36108, 0xffffffff)
+		        /snap/go/10339/src/sync/mutex.go:229 +0x35
+		sync.(*Mutex).Unlock(0x0?)
+		        /snap/go/10339/src/sync/mutex.go:223 +0x25
+		panic({0x2e34b60?, 0x4bb04f0?})
+		        /snap/go/10339/src/runtime/panic.go:914 +0x21f
+		github.com/rclone/rclone/backend/meganative.(*Fs).write(0xc000882000, {0x38c3808, 0xc000544a00}, 0xc000651680, {0x38a2960, 0xc000a89600}, {0x7fdff816c4c0, 0xc0009adc80}, 0x1)
+		        /mnt/newfiles/Work/rclone/backend/meganative/meganative.go:989 +0x9d0
+		github.com/rclone/rclone/backend/meganative.(*Object).Update(0xc000651680, {0x38c3808, 0xc000544a00}, {0x38a2960, 0xc000a89600}, {0x7fdff816c4c0, 0xc0009adc80}, {0xc000ac0e30, 0x1, 0x1})
+		        /mnt/newfiles/Work/rclone/backend/meganative/meganative.go:1102 +0xb1
+		github.com/rclone/rclone/fs/operations.Copy({0x38c3808, 0xc000544a00}, {0x38d77a8, 0xc000882000}, {0x38d7818?, 0xc000651680?}, {0xc000d3c16a, 0x15}, {0x38d7578, 0xc0009adc80})
+		        /mnt/newfiles/Work/rclone/fs/operations/operations.go:474 +0x2408
+		github.com/rclone/rclone/vfs/vfscache.(*Item)._store(0xc000a36100, {0x38c3808, 0xc000544a00}, 0xc000ac0b00)
+		        /mnt/newfiles/Work/rclone/vfs/vfscache/item.go:593 +0x1de
+		github.com/rclone/rclone/vfs/vfscache.(*Item).store(0x1a?, {0x38c3808?, 0xc000544a00?}, 0x0?)
+		        /mnt/newfiles/Work/rclone/vfs/vfscache/item.go:629 +0xc6
+		github.com/rclone/rclone/vfs/vfscache.(*Item).Close.func2({0x38c3808?, 0xc000544a00?})
+		        /mnt/newfiles/Work/rclone/vfs/vfscache/item.go:728 +0x2e
+		github.com/rclone/rclone/vfs/vfscache/writeback.(*WriteBack).upload(0xc000ade0e0, {0x38c3808, 0xc000544a00}, 0xc000ade230)
+		        /mnt/newfiles/Work/rclone/vfs/vfscache/writeback/writeback.go:354 +0x128
+		created by github.com/rclone/rclone/vfs/vfscache/writeback.(*WriteBack).processItems in goroutine 229
+		        /mnt/newfiles/Work/rclone/vfs/vfscache/writeback/writeback.go:450 +0x28e
+
+		goroutine 1 [select]:
+		github.com/rclone/rclone/cmd/mountlib.(*MountPoint).Wait(0xc000623980)
+		        /mnt/newfiles/Work/rclone/cmd/mountlib/mount.go:300 +0x265
+		github.com/rclone/rclone/cmd/mountlib.NewMountCommand.func1(0xc000a89700?, {0xc0009ad200?, 0x2, 0x328520c?})
+		        /mnt/newfiles/Work/rclone/cmd/mountlib/mount.go:194 +0x2b8
+		github.com/spf13/cobra.(*Command).execute(0xc000a4ac00, {0xc0009ad1a0, 0x6, 0x6})
+		        /home/niller/go/pkg/mod/github.com/spf13/cobra@v1.7.0/command.go:944 +0x863
+		github.com/spf13/cobra.(*Command).ExecuteC(0x4bd00a0)
+		        /home/niller/go/pkg/mod/github.com/spf13/cobra@v1.7.0/command.go:1068 +0x3a5
+		github.com/spf13/cobra.(*Command).Execute(...)
+		        /home/niller/go/pkg/mod/github.com/spf13/cobra@v1.7.0/command.go:992
+		github.com/rclone/rclone/cmd.Main()
+		        /mnt/newfiles/Work/rclone/cmd/cmd.go:570 +0x71
+		main.main()
+		        /mnt/newfiles/Work/rclone/rclone.go:14 +0xf
+
+		goroutine 17 [syscall, locked to thread]:
+		runtime.goexit()
+		        /snap/go/10339/src/runtime/asm_amd64.s:1650 +0x1
+
+		goroutine 82 [select]:
+		go.opencensus.io/stats/view.(*worker).start(0xc000053000)
+		        /home/niller/go/pkg/mod/go.opencensus.io@v0.24.0/stats/view/worker.go:292 +0x9f
+		created by go.opencensus.io/stats/view.init.0 in goroutine 1
+		        /home/niller/go/pkg/mod/go.opencensus.io@v0.24.0/stats/view/worker.go:34 +0x8d
+
+		goroutine 98 [syscall]:
+		os/signal.signal_recv()
+		        /snap/go/10339/src/runtime/sigqueue.go:152 +0x29
+		os/signal.loop()
+		        /snap/go/10339/src/os/signal/signal_unix.go:23 +0x13
+		created by os/signal.Notify.func1.1 in goroutine 1
+		        /snap/go/10339/src/os/signal/signal.go:151 +0x1f
+
+		goroutine 99 [chan receive]:
+		github.com/rclone/rclone/fs/accounting.(*tokenBucket).startSignalHandler.func1()
+		        /mnt/newfiles/Work/rclone/fs/accounting/accounting_unix.go:25 +0x27
+		created by github.com/rclone/rclone/fs/accounting.(*tokenBucket).startSignalHandler in goroutine 1
+		        /mnt/newfiles/Work/rclone/fs/accounting/accounting_unix.go:22 +0xab
+
+		goroutine 182 [select]:
+		github.com/rclone/rclone/fs/accounting.(*StatsInfo).averageLoop(0xc000994000)
+		        /mnt/newfiles/Work/rclone/fs/accounting/stats.go:332 +0x166
+		created by github.com/rclone/rclone/fs/accounting.(*StatsInfo).startAverageLoop.func1 in goroutine 181
+		        /mnt/newfiles/Work/rclone/fs/accounting/stats.go:361 +0x69
+
+		goroutine 96 [syscall]:
+		syscall.Syscall(0x122fcc5?, 0x4bbf500?, 0x11bbac5?, 0x2f242c0?)
+		        /snap/go/10339/src/syscall/syscall_linux.go:69 +0x25
+		syscall.read(0x4bbf500?, {0xc000c42000?, 0x4?, 0xc0009d7400?})
+		        /snap/go/10339/src/syscall/zsyscall_linux_amd64.go:721 +0x38
+		syscall.Read(...)
+		        /snap/go/10339/src/syscall/syscall_unix.go:181
+		bazil.org/fuse.(*Conn).ReadRequest(0xc0009ad680)
+		        /home/niller/go/pkg/mod/bazil.org/fuse@v0.0.0-20221209211307-2abb8038c751/fuse.go:582 +0xce
+		bazil.org/fuse/fs.(*Server).Serve(0xc00099e0e0, {0x38a29c0?, 0xc00097ade0})
+		        /home/niller/go/pkg/mod/bazil.org/fuse@v0.0.0-20221209211307-2abb8038c751/fs/serve.go:504 +0x385
+		github.com/rclone/rclone/cmd/mount.mount.func2()
+		        /mnt/newfiles/Work/rclone/cmd/mount/mount.go:101 +0x34
+		created by github.com/rclone/rclone/cmd/mount.mount in goroutine 1
+		        /mnt/newfiles/Work/rclone/cmd/mount/mount.go:100 +0x3d0
+
+		goroutine 97 [chan receive]:
+		github.com/rclone/rclone/lib/atexit.Register.func1.1()
+		        /mnt/newfiles/Work/rclone/lib/atexit/atexit.go:45 +0x29
+		created by github.com/rclone/rclone/lib/atexit.Register.func1 in goroutine 1
+		        /mnt/newfiles/Work/rclone/lib/atexit/atexit.go:44 +0x68
+
+		goroutine 93 [select]:
+		github.com/rclone/rclone/vfs/vfscache.(*Cache).cleaner(0xc000a404b0, {0x38c3808, 0xc000ace140})
+		        /mnt/newfiles/Work/rclone/vfs/vfscache/cache.go:836 +0x15c
+		created by github.com/rclone/rclone/vfs/vfscache.New in goroutine 1
+		        /mnt/newfiles/Work/rclone/vfs/vfscache/cache.go:145 +0x6db
+	*/
 
 	// Delete old node
-	err = nil
-	if node != nil {
+	if dstObj.info != nil {
 		// TODO: Is this correct and allows versioning, or should i move to trash?
-		err = f.hardDelete(*node)
+		err = f.delete(*dstObj.info)
+		if err != nil {
+			return dstObj, fmt.Errorf("upload failed to remove old version: %w", err)
+		}
+		dstObj.info = nil
+	}
+
+	node, err := f.findObject(dstObj.remote)
+	if err != nil {
+		dstObj.info = node
 	}
 
 	return dstObj, err
@@ -948,12 +1224,11 @@ func (f *Fs) About(ctx context.Context) (*fs.Usage, error) {
 // PublicLink generates a public link to the remote path (usually readable by anyone)
 func (f *Fs) PublicLink(ctx context.Context, remote string, expire fs.Duration, unlink bool) (string, error) {
 	fmt.Printf("PATH71")
-	node := f.API().GetNodeByPath(f.parsePath(remote))
-	if node.Swigcptr() == 0 {
-		return "", fmt.Errorf("object not found")
+	node, err := f.getObject(remote)
+	if err != nil {
+		return "", err
 	}
 
-	var err error
 	link := node.GetPublicLink(true)
 	if link == "" {
 		err = fmt.Errorf("non-exported file")
@@ -968,14 +1243,15 @@ func (f *Fs) PutUnchecked(ctx context.Context, in io.Reader, src fs.ObjectInfo, 
 		remote: src.Remote(),
 	}
 
-	return f.write(ctx, dstObj, in, src, false)
+	fmt.Printf("ER1\n")
+	return f.write(ctx, dstObj, in, src)
 }
 
 // Update implements fs.Object.
 func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) error {
-	fmt.Printf("HERE5\n")
+	fmt.Printf("ER2\n")
 	// TODO: Test this
-	_, err := (*o.fs).write(ctx, o, in, src, false)
+	_, err := (*o.fs).write(ctx, o, in, src)
 	return err
 }
 
