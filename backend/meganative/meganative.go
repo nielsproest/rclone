@@ -613,7 +613,7 @@ func (f *Fs) Precision() time.Duration {
 
 // Put implements fs.Fs.
 func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
-	fmt.Printf("HERE11\n")
+	fmt.Printf("HERE13\n")
 	existingObj, err := f.findObject(src.Remote())
 	if err != nil {
 		return f.PutUnchecked(ctx, in, src, options...)
@@ -660,6 +660,7 @@ type BufferedReaderCloser struct {
 	bufferSize int
 	bufferMu   sync.Mutex
 	closed     bool
+	paused     bool
 	obj        *Object
 	listener   *MyMegaTransferListener
 }
@@ -670,12 +671,13 @@ func NewBufferedReaderCloser(bufferSize int) *BufferedReaderCloser {
 		buffer:     []byte{},
 		bufferSize: bufferSize,
 		closed:     false,
+		paused:     false,
 	}
 }
 
 // Check if the buffer size exceeds double the bufferSize
 func (b *BufferedReaderCloser) CheckExceeds() {
-	if len(b.buffer) < b.bufferSize {
+	if b.paused || len(b.buffer) < b.bufferSize {
 		return
 	}
 
@@ -683,14 +685,16 @@ func (b *BufferedReaderCloser) CheckExceeds() {
 	if _transfer != nil {
 		transfer := *_transfer
 		if transfer.GetState() == mega.MegaTransferSTATE_ACTIVE {
-			b.obj.fs.setPause(transfer, true)
+			if err := b.obj.fs.setPause(transfer, true); err != nil {
+				b.paused = true
+			}
 		}
 	}
 }
 
 // Check if the buffer size is less or equal to the buffer size
 func (b *BufferedReaderCloser) CheckLess() {
-	if len(b.buffer) > b.bufferSize/2 {
+	if !b.paused || len(b.buffer) > b.bufferSize/2 {
 		return
 	}
 
@@ -698,7 +702,9 @@ func (b *BufferedReaderCloser) CheckLess() {
 	if _transfer != nil {
 		transfer := *_transfer
 		if transfer.GetState() == mega.MegaTransferSTATE_PAUSED {
-			b.obj.fs.setPause(transfer, false)
+			if err := b.obj.fs.setPause(transfer, false); err != nil {
+				b.paused = false
+			}
 		}
 	}
 }
@@ -795,7 +801,7 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 		}
 	}
 
-	// Bigger than file limit
+	// Fixes
 	if 0 > offset {
 		offset = 0
 	}
@@ -915,7 +921,7 @@ func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object,
 		return nil, err
 	}
 
-	/* TODO: VFS Error
+	/* TODO: VFS Error on overwrite when mounted? (this or DirMove)
 	2023/10/04 22:12:16 ERROR : sd.txt: Failed to copy: upload failed to remove old version: move error: Access denied
 	2023/10/04 22:12:16 ERROR : sd.txt: vfs cache: failed to upload try #3, will retry in 40s: vfs cache: failed to transfer file from cache to remote: upload failed to remove old version: move error: Access denied
 	2023/10/04 22:12:36 DEBUG : vfs cache RemoveNotInUse (maxAge=3600000000000, emptyOnly=false): item .sd.txt.swp not removed, freed 0 bytes
@@ -990,7 +996,7 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 }
 
 func (f *Fs) write(ctx context.Context, dstObj *Object, in io.Reader, src fs.ObjectInfo) (*Object, error) {
-	fmt.Printf("HERE1\n")
+	fmt.Printf("HERE10\n")
 
 	parentNode, err := f.mkdirParent(dstObj.remote)
 	if err != nil && err != fs.ErrorDirExists {
@@ -1092,8 +1098,8 @@ func (f *Fs) MergeDirs(ctx context.Context, dirs []fs.Directory) error {
 				return err
 			}
 
-			// TODO: Is this correct and allows versioning, or should i move to trash?
-			if err := f.hardDelete(node); err != nil {
+			// TODO: Is this correct
+			if err := f.delete(node); err != nil {
 				return err
 			}
 		}
@@ -1154,7 +1160,6 @@ func (f *Fs) PutUnchecked(ctx context.Context, in io.Reader, src fs.ObjectInfo, 
 // Update implements fs.Object.
 func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) error {
 	fmt.Printf("ER2\n")
-	// TODO: Test this
 	_, err := (*o.fs).write(ctx, o, in, src)
 	return err
 }
@@ -1246,7 +1251,6 @@ func (f *Fs) Features() *fs.Features {
 
 // Hashes returns the supported hash sets.
 func (f *Fs) Hashes() hash.Set {
-	// TODO: Mega supports CRC, but im unsure of the format
 	return hash.Set(hash.None)
 }
 
