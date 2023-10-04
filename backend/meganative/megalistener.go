@@ -16,6 +16,7 @@ type MyMegaListener struct {
 	cwd      *mega.MegaNode
 }
 
+// TODO: More debug prints
 func (l *MyMegaListener) OnRequestFinish(api mega.MegaApi, request mega.MegaRequest, e mega.MegaError) {
 	req := request.Copy()
 	err := e.Copy()

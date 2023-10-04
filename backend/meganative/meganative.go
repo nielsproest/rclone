@@ -388,12 +388,13 @@ func (f *Fs) mkdirParent(path string) (*mega.MegaNode, error) {
 }
 
 func (f *Fs) iterChildren(node mega.MegaNode) (<-chan mega.MegaNode, error) {
+	dataCh := make(chan mega.MegaNode)
+
 	children := f.API().GetChildren(node)
 	if children.Swigcptr() == 0 {
-		return nil, fs.ErrorListAborted
+		return dataCh, fs.ErrorListAborted
 	}
 
-	dataCh := make(chan mega.MegaNode)
 	go func() {
 		defer close(dataCh)
 		for i := 0; i < children.Size(); i++ {
@@ -424,7 +425,7 @@ func (f *Fs) mkdir(name string, parent *mega.MegaNode) (*mega.MegaNode, error) {
 	// Find resulting folder
 	children, err := f.iterChildren(*parent)
 	if err != nil {
-		return nil, fmt.Errorf("failed to find children of folder %s", name)
+		return nil, err
 	}
 
 	for node := range children {
