@@ -237,7 +237,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		return f, nil // TODO: fs.ErrorObjectNotFound ?
 	}
 
-	f._rootNode = &rootNode
+	//f._rootNode = &rootNode
 	switch rootNode.GetType() {
 	case mega.MegaNodeTYPE_FOLDER:
 		// root node found and is a directory
@@ -279,6 +279,7 @@ func (f *Fs) getObject(dir string) (mega.MegaNode, error) {
 
 	node := f.API().GetNodeByPath(trimmedDir, *_rootNode)
 	if node.Swigcptr() == 0 {
+		fmt.Printf("c %s\n", trimmedDir)
 		return nil, fs.ErrorObjectNotFound
 	}
 
@@ -436,6 +437,9 @@ func (f *Fs) mkdirParent(path string) (*mega.MegaNode, error) {
 	// If parent dir exists
 	_root, _ := filepath.Split(path)
 	_rootNode := f.API().GetNodeByPath(_root, rootNode)
+
+	fmt.Printf("K %s %s\n", path, _root)
+
 	if _rootNode.Swigcptr() != 0 {
 		return &_rootNode, fs.ErrorDirExists
 	}
@@ -572,10 +576,20 @@ func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 		remote: remote,
 	}
 
-	_, err := f.mkdirParent(remote)
+	dbg, err := f.mkdirParent(remote)
 	if err != nil && err != fs.ErrorDirExists {
 		fmt.Printf("BUGG1 %s\n", err.Error())
 		return o, err
+	}
+
+	children, err := f.iterChildren(*dbg)
+	if err != nil {
+		return nil, err
+	}
+
+	fmt.Printf("parent %s\n", (*dbg).GetName())
+	for child := range children {
+		fmt.Printf("object %s\n", child.GetName())
 	}
 
 	n, err := f.getObject(remote)
@@ -743,8 +757,8 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 	listener := mega.NewDirectorMegaTransferListener(&listenerObj)
 	listenerObj.director = &listener
 
-	// 1KB buffer
-	reader := NewBufferedReaderCloser(1024)
+	// 1MB buffer
+	reader := NewBufferedReaderCloser(1024 * 1024)
 	listenerObj.out = reader
 	reader.obj = o
 	reader.listener = &listenerObj
