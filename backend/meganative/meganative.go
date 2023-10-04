@@ -723,6 +723,7 @@ func (b *BufferedReaderCloser) EOF() {
 	fmt.Printf("FILE EOF\n")
 	b.closed = true
 }*/
+
 // BufferedReaderCloser is a custom type that implements io.ReaderCloser
 type BufferedReaderCloser struct {
 	buffer   []byte
@@ -743,7 +744,7 @@ func NewBufferedReaderCloser(bufferSize int) *BufferedReaderCloser {
 // Read reads data from the buffer.
 func (b *BufferedReaderCloser) Read(p []byte) (n int, err error) {
 	for len(b.buffer) == 0 && !b.closed {
-		time.Sleep(time.Millisecond * 100)
+		time.Sleep(time.Millisecond * 10)
 	}
 
 	if b.closed {
