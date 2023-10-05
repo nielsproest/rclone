@@ -38,8 +38,7 @@ func (l *MyMegaListener) OnRequestFinish(api mega.MegaApi, request mega.MegaRequ
 	l.cv.Broadcast()
 
 	if err.GetErrorCode() != mega.MegaErrorAPI_OK {
-		fmt.Printf("INFO: Request finished with error\n")
-		return
+		fmt.Printf("INFO: Request finished with error %d-%s\n", err.GetErrorCode(), err.ToString())
 	}
 }
 

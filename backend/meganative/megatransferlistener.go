@@ -43,8 +43,7 @@ func (l *MyMegaTransferListener) OnTransferFinish(api mega.MegaApi, transfer meg
 	}
 
 	if err.GetErrorCode() != mega.MegaErrorAPI_OK {
-		fmt.Printf("INFO: Transfer finished with error %s\n", err.ToString())
-		return
+		fmt.Printf("INFO: Transfer finished with error %d-%s\n", err.GetErrorCode(), err.ToString())
 	}
 }
 
