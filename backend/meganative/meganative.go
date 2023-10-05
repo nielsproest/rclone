@@ -829,22 +829,14 @@ func (b *BufferedReaderCloser) Close() error {
 	fs.Debugf(b.fs, "File Close")
 
 	// Ask Mega kindly to stop
-	/*transfer := b.listener.GetTransfer()
-	if transfer != nil {
-		// TODO: Attach listener to this?
+	transfer := b.listener.GetTransfer()
+	if transfer != nil && ((*transfer).GetState() == mega.MegaTransferSTATE_ACTIVE || (*transfer).GetState() == mega.MegaTransferSTATE_PAUSED) {
+		// TODO: Without a dedicated listener, it writes to the transfer listener
 		b.fs.API().CancelTransfer(*transfer)
-	}*/
+	}
 
 	// TODO: Causes crashes?
 	//defer mega.DeleteDirectorMegaTransferListener(*b.listener.director)
-
-	/*
-		2023/10/05 16:14:21 DEBUG : mega root '/memes': Size video14058428974.mp4
-		2023/10/05 16:14:21 DEBUG : mega root '/memes': File Close
-		2023/10/05 16:14:21 DEBUG : mega root '/memes': File Close 2
-		INFO: Request finished with error -9 - Not found
-		zsh: segmentation fault (core dumped)  ./rclone -vvv mount --allow-other --vfs-cache-mode writes test:memes
-	*/
 
 	// b.listener.Wait()
 	/*merr := b.listener.GetError()
@@ -943,13 +935,6 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 
 	// Create listener
 	listenerObj, listener := getTransferListener()
-
-	/* TODO BUG: If mounted read fails
-	2023/10/05 16:41:00 DEBUG : mega root '/memes': File Close
-	2023/10/05 16:41:00 DEBUG : mega root '/memes': File Close 2
-	INFO: Request finished with error -9 - Not found
-	segmentation fault (core dumped)  ./rclone -vvv mount --allow-other --vfs-cache-mode writes test:memes
-	*/
 
 	// 4MB buffer
 	// TODO: Config this?
