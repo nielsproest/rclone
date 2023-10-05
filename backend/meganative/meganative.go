@@ -1027,7 +1027,7 @@ func (f *Fs) Purge(ctx context.Context, dir string) error {
 //
 // If it isn't possible then return fs.ErrorCantMove
 func (dstFs *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object, error) {
-	fs.Debugf(dstFs, "Move %q -> %q", src.Remote(), remote)
+	fs.Debugf(dstFs, "Move")
 
 	srcObj, ok := src.(*Object)
 	if !ok {
@@ -1057,25 +1057,9 @@ func (dstFs *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Obj
 	absDst, _ := dstFs.parsePath(remote)
 	absSrc = filepath.Join(srcFs.root, absSrc)
 	absDst = filepath.Join(dstFs.root, absDst)
+	fs.Debugf(dstFs, "Move %q -> %q", absSrc, absDst)
 	srcPath, srcName := filepath.Split(absSrc)
 	dstPath, dstName := filepath.Split(absDst)
-
-	/* TODO BUG: moveto is fixed, but mounted still buggy?
-	2023/10/05 21:32:21 DEBUG : Hey/: Rename: oldName="dsf.txt", newName="dsf.txt", newDir=mmm/
-	2023/10/05 21:32:21 DEBUG : mega root '/memes': NewObject mmm/dsf.txt
-	2023/10/05 21:32:21 DEBUG : mega root '/memes': mkdirParent mmm/dsf.txt
-	2023/10/05 21:32:21 DEBUG : mega root '/memes': getObject mmm/dsf.txt
-	2023/10/05 21:32:21 DEBUG : mega root '/memes': Size Hey/dsf.txt
-	2023/10/05 21:32:21 DEBUG : mega root '/memes': Size mmm/dsf.txt
-	2023/10/05 21:32:21 DEBUG : mega root '/memes': Size mmm/dsf.txt
-	2023/10/05 21:32:21 DEBUG : mega root '/memes': Remove mmm/dsf.txt
-	2023/10/05 21:32:21 DEBUG : mega root '/memes': String mmm/dsf.txt
-	2023/10/05 21:32:21 ERROR : mmm/dsf.txt: Couldn't delete: object not found
-	2023/10/05 21:32:21 ERROR : mmm/dsf.txt: File.Rename error: object not found
-	2023/10/05 21:32:21 ERROR : Hey/dsf.txt: Dir.Rename error: object not found
-	2023/10/05 21:32:21 DEBUG : Hey/: >Rename: err=no such file or directory
-
-	*/
 
 	if srcPath != dstPath {
 		if err := dstFs.moveNode(*srcNode, *destNode); err != nil {
@@ -1101,6 +1085,7 @@ func (dstFs *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Obj
 //
 // If destination exists then return fs.ErrorDirExists
 func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string) error {
+	fs.Debugf(dstFs, "DirMove")
 	dstFs := f
 	srcFs, ok := src.(*Fs)
 	if !ok {
@@ -1109,10 +1094,6 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 	}
 
 	// TODO: Test this
-
-	absSrc, _ := srcFs.parsePath(srcRemote)
-	absDst, _ := dstFs.parsePath(dstRemote)
-	fs.Debugf(f, "DirMove: %s -> %s", absSrc, absDst)
 
 	srcNode, err := srcFs.findDir(srcRemote)
 	if err != nil {
@@ -1124,8 +1105,14 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 		return err
 	}
 
+	absSrc, _ := srcFs.parsePath(srcRemote)
+	absDst, _ := dstFs.parsePath(dstRemote)
+	absSrc = filepath.Join(srcFs.root, absSrc)
+	absDst = filepath.Join(dstFs.root, absDst)
+	fs.Debugf(f, "DirMove: %s -> %s", absSrc, absDst)
 	srcPath, srcName := filepath.Split(absSrc)
 	destPath, destName := filepath.Split(absDst)
+
 	if srcPath != destPath {
 		if err := f.moveNode(*srcNode, *dstNode); err != nil {
 			return err
