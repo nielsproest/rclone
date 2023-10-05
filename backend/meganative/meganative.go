@@ -1084,9 +1084,8 @@ func (dstFs *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Obj
 // If it isn't possible then return fs.ErrorCantDirMove
 //
 // If destination exists then return fs.ErrorDirExists
-func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string) error {
+func (dstFs *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string) error {
 	fs.Debugf(dstFs, "DirMove")
-	dstFs := f
 	srcFs, ok := src.(*Fs)
 	if !ok {
 		fs.Debugf(srcFs, "Can't move directory - not same remote type")
@@ -1109,17 +1108,17 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 	absDst, _ := dstFs.parsePath(dstRemote)
 	absSrc = filepath.Join(srcFs.root, absSrc)
 	absDst = filepath.Join(dstFs.root, absDst)
-	fs.Debugf(f, "DirMove: %s -> %s", absSrc, absDst)
+	fs.Debugf(dstFs, "DirMove: %s -> %s", absSrc, absDst)
 	srcPath, srcName := filepath.Split(absSrc)
 	destPath, destName := filepath.Split(absDst)
 
 	if srcPath != destPath {
-		if err := f.moveNode(*srcNode, *dstNode); err != nil {
+		if err := dstFs.moveNode(*srcNode, *dstNode); err != nil {
 			return err
 		}
 	}
 	if srcName != destName {
-		if err := f.renameNode(*srcNode, destName); err != nil {
+		if err := dstFs.renameNode(*srcNode, destName); err != nil {
 			return err
 		}
 	}
