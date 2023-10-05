@@ -332,7 +332,7 @@ func intToTime(num int64) time.Time {
 // getObject looks up the node for the path of the name given from the root given
 //
 // It returns mega.ENOENT if it wasn't found
-func (f *Fs) getObject(dir string) (mega.MegaNode, error) {
+func (f *Fs) getObject(dir string) (*mega.MegaNode, error) {
 	trimmedDir, _rootNode := f.parsePath(dir)
 	if _rootNode == nil || (*_rootNode).Swigcptr() == 0 {
 		return nil, fmt.Errorf("root not found")
@@ -343,7 +343,7 @@ func (f *Fs) getObject(dir string) (mega.MegaNode, error) {
 		return nil, fs.ErrorObjectNotFound
 	}
 
-	return node, nil
+	return &node, nil
 }
 
 // findDir finds the directory rooted from the node passed in
@@ -358,11 +358,11 @@ func (f *Fs) findDir(dir string) (*mega.MegaNode, error) {
 		return nil, err
 	}
 
-	if n.Swigcptr() != 0 && n.GetType() == mega.MegaNodeTYPE_FILE {
+	if (*n).Swigcptr() != 0 && (*n).GetType() == mega.MegaNodeTYPE_FILE {
 		return nil, fs.ErrorIsFile
 	}
 
-	return &n, nil
+	return n, nil
 }
 
 // findObject looks up the node for the object of the name given
@@ -374,10 +374,10 @@ func (f *Fs) findObject(file string) (*mega.MegaNode, error) {
 		return nil, err
 	}
 
-	if n.Swigcptr() != 0 && n.GetType() != mega.MegaNodeTYPE_FILE {
+	if (*n).Swigcptr() != 0 && (*n).GetType() != mega.MegaNodeTYPE_FILE {
 		return nil, fs.ErrorIsDir
 	}
-	return &n, nil
+	return n, nil
 }
 
 // Create request listener (remember to destroy it after)
@@ -672,7 +672,7 @@ func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 		return o, err
 	}
 
-	o.info = &n
+	o.info = n
 
 	return o, err
 }
@@ -1206,7 +1206,7 @@ func (f *Fs) PublicLink(ctx context.Context, remote string, expire fs.Duration, 
 		return "", err
 	}
 
-	link := node.GetPublicLink(true)
+	link := (*node).GetPublicLink(true)
 	if link == "" {
 		err = fmt.Errorf("non-exported file")
 	}
