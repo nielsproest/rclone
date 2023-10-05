@@ -30,6 +30,7 @@ import (
  * Remove the dozen of debug calls (or make them proper debug calls with the debug fs flag),
  * actually i should find if MEGA has optional debug flags i can set.
  * Potentially find a better upload method.
+ * Remove unnecessary pointers
  *
  * But most importantly at the end:
  * Find a way to ship this thing
@@ -608,7 +609,6 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 		return nil, err
 	}
 
-	// TODO: Some pointer bug that causes same size for all files?
 	for node := range children {
 		remote := path.Join(dir, f.opt.Enc.ToStandardName(node.GetName()))
 		switch node.GetType() {
@@ -1092,8 +1092,6 @@ func (dstFs *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote st
 		return fs.ErrorCantDirMove
 	}
 
-	// TODO: Test this
-
 	srcNode, err := srcFs.findDir(srcRemote)
 	if err != nil {
 		return err
@@ -1202,10 +1200,10 @@ func (o *Object) Fs() fs.Info {
 
 // Return a string version
 func (o *Object) String() string {
-	fs.Debugf(o.fs, "String %s", o.Remote())
 	if o == nil {
 		return "<nil>"
 	}
+	fs.Debugf(o.fs, "String %s", o.Remote())
 	path, _ := o.fs.parsePath(o.remote)
 	return path
 }
@@ -1226,7 +1224,7 @@ func (o *Object) Hash(ctx context.Context, ty hash.Type) (string, error) {
 		return "", err
 	}
 
-	return o.fs.API().GetCRC(node), nil
+	return o.fs.API().GetCRC(*node), nil
 }
 
 // Size returns the size of an object in bytes
