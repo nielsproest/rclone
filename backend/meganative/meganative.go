@@ -566,7 +566,7 @@ func (f *Fs) mkdir(name string, parent *mega.MegaNode) (*mega.MegaNode, error) {
 
 	// Create folder
 	listenerObj.Reset()
-	f.API().CreateFolder(name, parent, listener)
+	f.API().CreateFolder(name, *parent, listener)
 	listenerObj.Wait()
 
 	if merr := getMegaError(listenerObj); merr != nil && merr.GetErrorCode() != mega.MegaErrorAPI_OK {
@@ -826,7 +826,7 @@ func (b *BufferedReaderCloser) Close() error {
 	b.bufferMu.Lock()
 	defer b.bufferMu.Unlock()
 
-	fs.Debugf(b.fs, "File Close")
+	fs.Debugf(b.fs, "File Close Start")
 
 	// Ask Mega kindly to stop
 	transfer := b.listener.GetTransfer()
@@ -844,7 +844,7 @@ func (b *BufferedReaderCloser) Close() error {
 		fs.Debugf(b.fs, "MEGA Transfer error: %d - %s", (*merr).GetErrorCode(), (*merr).ToString())
 	}*/
 
-	fs.Debugf(b.fs, "File Close 2")
+	fs.Debugf(b.fs, "File Close End")
 
 	b.closed = true
 	return nil
@@ -1056,6 +1056,7 @@ func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object,
 	absDst, _ := f.parsePath(remote)
 	srcPath, srcName := filepath.Split(absSrc)
 	dstPath, dstName := filepath.Split(absDst)
+	// TODO: Some bug when mounted
 	if srcPath != dstPath {
 		if err := f.moveNode(*srcNode, *destNode); err != nil {
 			return nil, err
