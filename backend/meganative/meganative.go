@@ -163,9 +163,10 @@ type Fs struct {
 // expect you to build an entire tree of all the objects in memory.
 // In this case we just store a pointer to the object.
 type Object struct {
-	fs     *Fs            // what this object is part of
-	remote string         // The remote path
-	info   *mega.MegaNode // pointer to the mega node
+	fs     *Fs    // what this object is part of
+	remote string // The remote path
+	handle int64
+	// info   *mega.MegaNode // pointer to the mega node
 }
 
 // Name of the remote (as passed into NewFs)
@@ -332,7 +333,9 @@ func intToTime(num int64) time.Time {
 // getObject looks up the node for the path of the name given from the root given
 //
 // It returns mega.ENOENT if it wasn't found
-func (f *Fs) getObject(dir string) (*mega.MegaNode, error) {
+func (f *Fs) getObject(dir string) (mega.MegaNode, error) {
+	fs.Debugf(f, "getObject %s", dir)
+
 	trimmedDir, _rootNode := f.parsePath(dir)
 	if _rootNode == nil || (*_rootNode).Swigcptr() == 0 {
 		return nil, fmt.Errorf("root not found")
@@ -343,7 +346,7 @@ func (f *Fs) getObject(dir string) (*mega.MegaNode, error) {
 		return nil, fs.ErrorObjectNotFound
 	}
 
-	return &node, nil
+	return node, nil
 }
 
 // findDir finds the directory rooted from the node passed in
@@ -358,11 +361,11 @@ func (f *Fs) findDir(dir string) (*mega.MegaNode, error) {
 		return nil, err
 	}
 
-	if (*n).Swigcptr() != 0 && (*n).GetType() == mega.MegaNodeTYPE_FILE {
+	if n.Swigcptr() != 0 && n.GetType() == mega.MegaNodeTYPE_FILE {
 		return nil, fs.ErrorIsFile
 	}
 
-	return n, nil
+	return &n, nil
 }
 
 // findObject looks up the node for the object of the name given
@@ -374,10 +377,10 @@ func (f *Fs) findObject(file string) (*mega.MegaNode, error) {
 		return nil, err
 	}
 
-	if (*n).Swigcptr() != 0 && (*n).GetType() != mega.MegaNodeTYPE_FILE {
+	if n.Swigcptr() != 0 && n.GetType() != mega.MegaNodeTYPE_FILE {
 		return nil, fs.ErrorIsDir
 	}
-	return n, nil
+	return &n, nil
 }
 
 // Create request listener (remember to destroy it after)
@@ -398,14 +401,14 @@ func getTransferListener() (*MyMegaTransferListener, mega.MegaTransferListener) 
 }
 
 // Permanently deletes a node
-func (f *Fs) hardDelete(node *mega.MegaNode) error {
-	fs.Debugf(f, "hardDelete %s", (*node).GetName())
+func (f *Fs) hardDelete(node mega.MegaNode) error {
+	fs.Debugf(f, "hardDelete %s", node.GetName())
 
 	listenerObj, listener := getRequestListener()
 	defer mega.DeleteDirectorMegaRequestListener(listener)
 
 	listenerObj.Reset()
-	f.API().Remove(*node, listener)
+	f.API().Remove(node, listener)
 	listenerObj.Wait()
 
 	if merr := getMegaError(listenerObj); merr != nil && merr.GetErrorCode() != mega.MegaErrorAPI_OK {
@@ -416,16 +419,15 @@ func (f *Fs) hardDelete(node *mega.MegaNode) error {
 }
 
 // Deletes a node
-func (f *Fs) delete(node *mega.MegaNode) error {
-	fs.Debugf(f, "delete %s", (*node).GetName())
+func (f *Fs) delete(node mega.MegaNode) error {
+	fs.Debugf(f, "delete %s", node.GetName())
 
 	if f.opt.HardDelete {
 		if err := f.hardDelete(node); err != nil {
 			return err
 		}
 	} else {
-		rubbish := f.API().GetRubbishNode()
-		if err := f.moveNode(node, &rubbish); err != nil {
+		if err := f.moveNode(node, f.API().GetRubbishNode()); err != nil {
 			return err
 		}
 	}
@@ -434,14 +436,14 @@ func (f *Fs) delete(node *mega.MegaNode) error {
 }
 
 // Moves a node into a directory node
-func (f *Fs) moveNode(node *mega.MegaNode, dir *mega.MegaNode) error {
-	fs.Debugf(f, "moveNode %s -> %s/", (*node).GetName(), (*dir).GetName())
+func (f *Fs) moveNode(node mega.MegaNode, dir mega.MegaNode) error {
+	fs.Debugf(f, "moveNode %s -> %s/", node.GetName(), dir.GetName())
 
 	listenerObj, listener := getRequestListener()
 	defer mega.DeleteDirectorMegaRequestListener(listener)
 
 	listenerObj.Reset()
-	f.API().MoveNode(*node, *dir, listener)
+	f.API().MoveNode(node, dir, listener)
 	listenerObj.Wait()
 
 	if merr := getMegaError(listenerObj); merr != nil && merr.GetErrorCode() != mega.MegaErrorAPI_OK {
@@ -452,14 +454,14 @@ func (f *Fs) moveNode(node *mega.MegaNode, dir *mega.MegaNode) error {
 }
 
 // Rename a node
-func (f *Fs) renameNode(node *mega.MegaNode, name string) error {
-	fs.Debugf(f, "rename %s -> %s", (*node).GetName(), name)
+func (f *Fs) renameNode(node mega.MegaNode, name string) error {
+	fs.Debugf(f, "rename %s -> %s", node.GetName(), name)
 
 	listenerObj, listener := getRequestListener()
 	defer mega.DeleteDirectorMegaRequestListener(listener)
 
 	listenerObj.Reset()
-	f.API().RenameNode(*node, name, listener)
+	f.API().RenameNode(node, name, listener)
 	listenerObj.Wait()
 
 	if merr := getMegaError(listenerObj); merr != nil && merr.GetErrorCode() != mega.MegaErrorAPI_OK {
@@ -545,8 +547,7 @@ func (f *Fs) iterChildren(node mega.MegaNode) (<-chan mega.MegaNode, error) {
 	go func() {
 		defer close(dataCh)
 		for i := 0; i < children.Size(); i++ {
-			cnode := children.Get(i)
-			dataCh <- cnode
+			dataCh <- children.Get(i)
 		}
 	}()
 
@@ -608,6 +609,7 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 		return nil, err
 	}
 
+	// TODO: Some pointer bug that causes same size for all files?
 	for node := range children {
 		remote := path.Join(dir, f.opt.Enc.ToStandardName(node.GetName()))
 		switch node.GetType() {
@@ -619,7 +621,7 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 			o := &Object{
 				fs:     f,
 				remote: remote,
-				info:   &node,
+				handle: node.GetHandle(),
 			}
 
 			entries = append(entries, o)
@@ -672,7 +674,7 @@ func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 		return o, err
 	}
 
-	o.info = n
+	o.handle = n.GetHandle()
 
 	return o, err
 }
@@ -702,7 +704,7 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options .
 	o := &Object{
 		fs:     f,
 		remote: src.Remote(),
-		info:   existingObj,
+		handle: (*existingObj).GetHandle(),
 	}
 
 	return o, o.Update(ctx, in, src, options...)
@@ -728,7 +730,7 @@ func (f *Fs) Rmdir(ctx context.Context, dir string) error {
 		return fmt.Errorf("folder not empty")
 	}*/
 
-	if err := f.delete(n); err != nil {
+	if err := f.delete(*n); err != nil {
 		return err
 	}
 
@@ -920,6 +922,11 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 		limit = o.Size() - offset
 	}
 
+	node, err := o.getRef()
+	if err != nil {
+		return nil, err
+	}
+
 	// Create listener
 	listenerObj, listener := getTransferListener()
 
@@ -931,7 +938,7 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 	reader.listener = listenerObj
 
 	listenerObj.Reset()
-	o.fs.API().StartStreaming(*o.info, offset, limit, listener)
+	o.fs.API().StartStreaming(node, offset, limit, listener)
 
 	return readers.NewLimitedReadCloser(reader, limit), nil
 }
@@ -947,21 +954,29 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 func (o *Object) Remove(ctx context.Context) error {
 	fs.Debugf(o.fs, "Remove %s", o.Remote())
 
-	if o.info == nil {
-		return fs.ErrorObjectNotFound
+	n, err := o.getRef()
+	if err != nil {
+		return err
 	}
-	n := *o.info
 
 	if !n.IsFile() {
 		return fs.ErrorIsDir
 	}
 
-	if err := o.fs.delete(&n); err != nil {
+	if err := o.fs.delete(n); err != nil {
 		return err
 	}
 
 	fs.Debugf(o.fs, "File deleted OK")
 	return nil
+}
+
+func (o *Object) getRef() (node mega.MegaNode, err error) {
+	node = o.fs.API().GetNodeByHandle(o.handle)
+	if node.Swigcptr() == 0 {
+		err = fs.ErrorObjectNotFound
+	}
+	return
 }
 
 // ------------------------------------------------------------
@@ -988,7 +1003,7 @@ func (f *Fs) Purge(ctx context.Context, dir string) error {
 		return fmt.Errorf("folder not empty")
 	}*/
 
-	if err := f.delete(n); err != nil {
+	if err := f.delete(*n); err != nil {
 		return err
 	}
 
@@ -1013,7 +1028,11 @@ func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object,
 		fs.Debugf(f, "Can't move - not same remote type")
 		return nil, fs.ErrorCantMove
 	}
-	srcNode := srcObj.info
+
+	srcNode, err := srcObj.getRef()
+	if err != nil {
+		return nil, err
+	}
 
 	dest, err := f.findObject(remote)
 	if err == nil && (*dest).IsFile() {
@@ -1032,7 +1051,7 @@ func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object,
 	srcPath, srcName := filepath.Split(absSrc)
 	dstPath, dstName := filepath.Split(absDst)
 	if srcPath != dstPath {
-		if err := f.moveNode(srcNode, destNode); err != nil {
+		if err := f.moveNode(srcNode, *destNode); err != nil {
 			return nil, err
 		}
 	}
@@ -1081,12 +1100,12 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 	srcPath, srcName := filepath.Split(absSrc)
 	destPath, destName := filepath.Split(absDst)
 	if srcPath != destPath {
-		if err := f.moveNode(srcNode, dstNode); err != nil {
+		if err := f.moveNode(*srcNode, *dstNode); err != nil {
 			return err
 		}
 	}
 	if srcName != destName {
-		if err := f.renameNode(srcNode, destName); err != nil {
+		if err := f.renameNode(*srcNode, destName); err != nil {
 			return err
 		}
 	}
@@ -1124,12 +1143,12 @@ func (f *Fs) MergeDirs(ctx context.Context, dirs []fs.Directory) error {
 		}
 
 		for node := range children {
-			if err := f.moveNode(&node, &dstNode); err != nil {
+			if err := f.moveNode(node, dstNode); err != nil {
 				return err
 			}
 
 			// TODO: Is this correct
-			if err := f.delete(&node); err != nil {
+			if err := f.delete(node); err != nil {
 				return err
 			}
 		}
@@ -1170,6 +1189,7 @@ func (o *Object) Fs() fs.Info {
 
 // Return a string version
 func (o *Object) String() string {
+	fs.Debugf(o.fs, "String %s", o.Remote())
 	if o == nil {
 		return "<nil>"
 	}
@@ -1184,17 +1204,28 @@ func (o *Object) Remote() string {
 
 // Hash implements fs.Object.
 func (o *Object) Hash(ctx context.Context, ty hash.Type) (string, error) {
+	fs.Debugf(o.fs, "Hash %s", o.Remote())
 	// TODO: Is reportedly a "Base64-encoded CRC of the file. The CRC of a file is a hash of its contents"
 	// But i cant figure it out
-	return o.fs.API().GetCRC(*o.info), nil
+
+	node, err := o.getRef()
+	if err != nil {
+		return "", err
+	}
+
+	return o.fs.API().GetCRC(node), nil
 }
 
 // Size returns the size of an object in bytes
 func (o *Object) Size() int64 {
-	if o.info != nil {
-		return (*o.info).GetSize()
+	fs.Debugf(o.fs, "Size %s", o.remote)
+
+	node, err := o.getRef()
+	if err != nil {
+		return -1
 	}
-	return -1
+
+	return node.GetSize()
 }
 
 // PublicLink generates a public link to the remote path (usually readable by anyone)
@@ -1206,7 +1237,7 @@ func (f *Fs) PublicLink(ctx context.Context, remote string, expire fs.Duration, 
 		return "", err
 	}
 
-	link := (*node).GetPublicLink(true)
+	link := node.GetPublicLink(true)
 	if link == "" {
 		err = fmt.Errorf("non-exported file")
 	}
@@ -1313,7 +1344,7 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	if mobj != nil {
 		node := f.API().GetNodeByHandle((*mobj).GetNodeHandle())
 		if node.Swigcptr() != 0 {
-			o.info = &node
+			o.handle = node.GetHandle()
 		}
 	}
 
@@ -1327,10 +1358,12 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 func (o *Object) ModTime(context.Context) time.Time {
 	fs.Debugf(o.fs, "ModTime %s", o.Remote())
 
-	if o.info != nil {
-		return intToTime((*o.info).GetModificationTime())
+	node, err := o.getRef()
+	if err != nil {
+		return time.Unix(0, 0)
 	}
-	return time.Unix(0, 0)
+
+	return intToTime(node.GetModificationTime())
 }
 
 // SetModTime sets the modification time of the local fs object
@@ -1345,7 +1378,14 @@ func (o *Object) Storable() bool {
 
 // ID returns the ID of the Object if known, or "" if not
 func (o *Object) ID() string {
-	return (*o.info).GetBase64Handle()
+	fs.Debugf(o.fs, "ID %s", o.Remote())
+
+	node, err := o.getRef()
+	if err != nil {
+		return ""
+	}
+
+	return node.GetBase64Handle()
 }
 
 // Check the interfaces are satisfied
