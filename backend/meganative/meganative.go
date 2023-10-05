@@ -287,6 +287,8 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		return f, nil
 	}
 
+	// TODO: This caused a bug before?
+	f._rootNode = &rootNode
 	switch rootNode.GetType() {
 	case mega.MegaNodeTYPE_FOLDER:
 		// root node found and is a directory
@@ -515,8 +517,6 @@ func (f *Fs) mkdirParent(path string) (*mega.MegaNode, error) {
 	// If parent dir exists
 	_root, _ := filepath.Split(path)
 	_rootNode := f.API().GetNodeByPath(_root, rootNode)
-
-	fmt.Printf("K %s %s\n", path, _root)
 
 	if _rootNode.Swigcptr() != 0 {
 		return &_rootNode, fs.ErrorDirExists
@@ -875,7 +875,8 @@ func (b *BufferedReaderCloser) EOF() {
 	defer b.bufferMu.Unlock()
 
 	fs.Debugf(b.fs, "File EOF")
-	b.Close()
+	// TODO: Test this (seemingly works?)
+	b.closed = true
 }
 
 // Open an object for read
@@ -1012,14 +1013,6 @@ func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object,
 		return nil, err
 	}
 
-	/* TODO: VFS Error on overwrite when mounted? (this or DirMove)
-	2023/10/04 22:12:16 ERROR : sd.txt: Failed to copy: upload failed to remove old version: move error: Access denied
-	2023/10/04 22:12:16 ERROR : sd.txt: vfs cache: failed to upload try #3, will retry in 40s: vfs cache: failed to transfer file from cache to remote: upload failed to remove old version: move error: Access denied
-	2023/10/04 22:12:36 DEBUG : vfs cache RemoveNotInUse (maxAge=3600000000000, emptyOnly=false): item .sd.txt.swp not removed, freed 0 bytes
-	2023/10/04 22:12:36 DEBUG : vfs cache RemoveNotInUse (maxAge=3600000000000, emptyOnly=false): item sd.txt not removed, freed 0 bytes
-	2023/10/04 22:12:36 INFO  : vfs cache: cleaned: objects 2 (was 2) in use 1, to upload 1, uploading 0, total size 4.955Ki (was 4.955Ki)
-	*/
-
 	absSrc, _ := f.parsePath(src.Remote())
 	absDst, _ := f.parsePath(remote)
 	srcPath, srcName := filepath.Split(absSrc)
@@ -1056,6 +1049,8 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 		fs.Debugf(srcFs, "Can't move directory - not same remote type")
 		return fs.ErrorCantDirMove
 	}
+
+	// TODO: Test this
 
 	absSrc, _ := srcFs.parsePath(srcRemote)
 	absDst, _ := dstFs.parsePath(dstRemote)
@@ -1243,11 +1238,11 @@ func (f *Fs) PutUnchecked(ctx context.Context, in io.Reader, src fs.ObjectInfo, 
 // If existing is set then it updates the object rather than creating a new one.
 //
 // The new object may have been created if an error is returned
-func (dstObj *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) error {
-	f := dstObj.fs
-	fs.Debugf(f, "Update %s", dstObj.Remote())
+func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) error {
+	f := o.fs
+	fs.Debugf(f, "Update %s", o.Remote())
 
-	parentNode, err := f.mkdirParent(dstObj.remote)
+	parentNode, err := f.mkdirParent(o.remote)
 	if err != nil && err != fs.ErrorDirExists {
 		fs.Debugf(f, "Parent folder creation failed")
 		return err
@@ -1268,13 +1263,16 @@ func (dstObj *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInf
 		return fmt.Errorf("failed to write temporary file")
 	}
 
+	// Create listener
 	listenerObj, listener := getTransferListener()
 	defer mega.DeleteDirectorMegaTransferListener(listener)
 
+	// Create cancel token
 	token := mega.MegaCancelTokenCreateInstance()
 	defer mega.DeleteMegaCancelToken(token)
 
-	_, fileName := filepath.Split(dstObj.remote)
+	// Upload
+	_, fileName := filepath.Split(o.remote)
 	listenerObj.Reset()
 	f.API().StartUpload(
 		tempFile.Name(),         //Localpath
@@ -1288,24 +1286,23 @@ func (dstObj *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInf
 		listener,                //Listener
 	)
 
+	// Wait
 	listenerObj.Wait()
+
+	// If error
 	merr := listenerObj.GetError()
 	if merr != nil && (*merr).GetErrorCode() != mega.MegaErrorAPI_OK {
 		return fmt.Errorf("couldn't upload: %d-%s", (*merr).GetErrorCode(), (*merr).ToString())
 	}
 
-	// Delete old node
-	if dstObj.info != nil {
-		err = f.delete(*dstObj.info)
-		if err != nil {
-			return fmt.Errorf("upload failed to remove old version: %w", err)
+	// Set metadata
+	// TODO: Do i have to do this?
+	mobj := listenerObj.GetTransfer()
+	if mobj != nil {
+		node := f.API().GetNodeByHandle((*mobj).GetNodeHandle())
+		if node.Swigcptr() != 0 {
+			o.info = &node
 		}
-		dstObj.info = nil
-	}
-
-	node, err := f.findObject(dstObj.remote)
-	if err != nil {
-		dstObj.info = &node
 	}
 
 	return err
