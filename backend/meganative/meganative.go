@@ -1087,77 +1087,6 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 	return nil
 }
 
-// TODO: Move into update and rely on that?
-func (f *Fs) write(ctx context.Context, dstObj *Object, in io.Reader, src fs.ObjectInfo) (*Object, error) {
-	fs.Debugf(f, "write: %s", dstObj.Remote())
-
-	parentNode, err := f.mkdirParent(dstObj.remote)
-	if err != nil && err != fs.ErrorDirExists {
-		fs.Debugf(f, "Parent folder creation failed")
-		return nil, err
-	}
-
-	// Create a temporary file
-	tempFile, err := os.CreateTemp(f.opt.Cache, "mega*.tmp")
-	if err != nil {
-		return dstObj, fmt.Errorf("failed to create temporary file")
-	}
-	defer os.Remove(tempFile.Name())
-
-	// Unlike downloads, there is no upload bytes interface
-	// It must be a file, so we create a temporary one
-	_, err = io.Copy(tempFile, in)
-	if err != nil {
-		return dstObj, fmt.Errorf("failed to write temporary file")
-	}
-	// TODO: Can we create a temporary file device?
-	// Probably not cross platform
-
-	listenerObj, listener := getTransferListener()
-	defer mega.DeleteDirectorMegaTransferListener(listener)
-
-	token := mega.MegaCancelTokenCreateInstance()
-	defer mega.DeleteMegaCancelToken(token)
-
-	_, fileName := filepath.Split(dstObj.remote)
-	// Somebody contact MEGA, ask them for a upload chunks interface :P
-	listenerObj.Reset()
-	f.API().StartUpload(
-		tempFile.Name(),         //Localpath
-		*parentNode,             //Directory
-		fileName,                //Filename
-		src.ModTime(ctx).Unix(), //Modification time
-		f.opt.Cache,             // Temporary directory
-		false,                   // Temporary source
-		false,                   // Priority
-		token,                   // Cancel token
-		listener,                //Listener
-	)
-
-	listenerObj.Wait()
-	merr := listenerObj.GetError()
-	if merr != nil && (*merr).GetErrorCode() != mega.MegaErrorAPI_OK {
-		return nil, fmt.Errorf("couldn't upload: %d-%s", (*merr).GetErrorCode(), (*merr).ToString())
-	}
-
-	// Delete old node
-	if dstObj.info != nil {
-		// TODO: Is this correct and allows versioning, or should i move to trash?
-		err = f.delete(*dstObj.info)
-		if err != nil {
-			return dstObj, fmt.Errorf("upload failed to remove old version: %w", err)
-		}
-		dstObj.info = nil
-	}
-
-	node, err := f.findObject(dstObj.remote)
-	if err != nil {
-		dstObj.info = &node
-	}
-
-	return dstObj, err
-}
-
 // MergeDirs merges the contents of all the directories passed
 // in into the first one and rmdirs the other directories.
 func (f *Fs) MergeDirs(ctx context.Context, dirs []fs.Directory) error {
@@ -1314,10 +1243,71 @@ func (f *Fs) PutUnchecked(ctx context.Context, in io.Reader, src fs.ObjectInfo, 
 // If existing is set then it updates the object rather than creating a new one.
 //
 // The new object may have been created if an error is returned
-func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) error {
-	fs.Debugf(o.fs, "Update %s", o.Remote())
+func (dstObj *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) error {
+	f := dstObj.fs
+	fs.Debugf(f, "Update %s", dstObj.Remote())
 
-	_, err := (*o.fs).write(ctx, o, in, src)
+	parentNode, err := f.mkdirParent(dstObj.remote)
+	if err != nil && err != fs.ErrorDirExists {
+		fs.Debugf(f, "Parent folder creation failed")
+		return err
+	}
+
+	// Create a temporary file
+	// Somebody contact MEGA, ask them for a upload chunks interface :P
+	tempFile, err := os.CreateTemp(f.opt.Cache, "mega*.tmp")
+	if err != nil {
+		return fmt.Errorf("failed to create temporary file")
+	}
+	defer os.Remove(tempFile.Name())
+
+	// Unlike downloads, there is no upload bytes interface
+	// It must be a file, so we create a temporary one
+	_, err = io.Copy(tempFile, in)
+	if err != nil {
+		return fmt.Errorf("failed to write temporary file")
+	}
+
+	listenerObj, listener := getTransferListener()
+	defer mega.DeleteDirectorMegaTransferListener(listener)
+
+	token := mega.MegaCancelTokenCreateInstance()
+	defer mega.DeleteMegaCancelToken(token)
+
+	_, fileName := filepath.Split(dstObj.remote)
+	listenerObj.Reset()
+	f.API().StartUpload(
+		tempFile.Name(),         //Localpath
+		*parentNode,             //Directory
+		fileName,                //Filename
+		src.ModTime(ctx).Unix(), //Modification time
+		f.opt.Cache,             // Temporary directory
+		false,                   // Temporary source
+		false,                   // Priority
+		token,                   // Cancel token
+		listener,                //Listener
+	)
+
+	listenerObj.Wait()
+	merr := listenerObj.GetError()
+	if merr != nil && (*merr).GetErrorCode() != mega.MegaErrorAPI_OK {
+		return fmt.Errorf("couldn't upload: %d-%s", (*merr).GetErrorCode(), (*merr).ToString())
+	}
+
+	// Delete old node
+	if dstObj.info != nil {
+		err = f.delete(*dstObj.info)
+		if err != nil {
+			return fmt.Errorf("upload failed to remove old version: %w", err)
+		}
+		dstObj.info = nil
+	}
+
+	node, err := f.findObject(dstObj.remote)
+	if err != nil {
+		dstObj.info = &node
+	}
+
 	return err
 }
 
