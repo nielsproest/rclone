@@ -1059,6 +1059,24 @@ func (dstFs *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Obj
 	absDst = filepath.Join(dstFs.root, absDst)
 	srcPath, srcName := filepath.Split(absSrc)
 	dstPath, dstName := filepath.Split(absDst)
+
+	/* TODO BUG: moveto is fixed, but mounted still buggy?
+	2023/10/05 21:32:21 DEBUG : Hey/: Rename: oldName="dsf.txt", newName="dsf.txt", newDir=mmm/
+	2023/10/05 21:32:21 DEBUG : mega root '/memes': NewObject mmm/dsf.txt
+	2023/10/05 21:32:21 DEBUG : mega root '/memes': mkdirParent mmm/dsf.txt
+	2023/10/05 21:32:21 DEBUG : mega root '/memes': getObject mmm/dsf.txt
+	2023/10/05 21:32:21 DEBUG : mega root '/memes': Size Hey/dsf.txt
+	2023/10/05 21:32:21 DEBUG : mega root '/memes': Size mmm/dsf.txt
+	2023/10/05 21:32:21 DEBUG : mega root '/memes': Size mmm/dsf.txt
+	2023/10/05 21:32:21 DEBUG : mega root '/memes': Remove mmm/dsf.txt
+	2023/10/05 21:32:21 DEBUG : mega root '/memes': String mmm/dsf.txt
+	2023/10/05 21:32:21 ERROR : mmm/dsf.txt: Couldn't delete: object not found
+	2023/10/05 21:32:21 ERROR : mmm/dsf.txt: File.Rename error: object not found
+	2023/10/05 21:32:21 ERROR : Hey/dsf.txt: Dir.Rename error: object not found
+	2023/10/05 21:32:21 DEBUG : Hey/: >Rename: err=no such file or directory
+
+	*/
+
 	if srcPath != dstPath {
 		if err := dstFs.moveNode(*srcNode, *destNode); err != nil {
 			return nil, err
