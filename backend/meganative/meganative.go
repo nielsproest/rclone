@@ -288,8 +288,6 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		return f, nil
 	}
 
-	// TODO: This caused a bug before?
-	f._rootNode = &rootNode
 	switch rootNode.GetType() {
 	case mega.MegaNodeTYPE_FOLDER:
 		// root node found and is a directory
@@ -598,6 +596,7 @@ func (f *Fs) mkdir(name string, parent *mega.MegaNode) (*mega.MegaNode, error) {
 // If the user fn ever returns true then it early exits with found = true
 func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err error) {
 	fs.Debugf(f, "List %s", dir)
+	f.rootFix()
 
 	dirNode, err := f.findDir(dir)
 	if err != nil {
@@ -658,6 +657,7 @@ func (f *Fs) Mkdir(ctx context.Context, dir string) error {
 // If it can't be found it returns the error fs.ErrorObjectNotFound.
 func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 	fs.Debugf(f, "NewObject %s", remote)
+	f.rootFix()
 
 	o := &Object{
 		fs:     f,
@@ -772,11 +772,13 @@ func (b *BufferedReaderCloser) CheckExceeds() {
 		transfer := *_transfer
 		if transfer.GetState() == mega.MegaTransferSTATE_ACTIVE {
 			if err := b.fs.setPause(transfer, true); err != nil {
-				b.paused = true
 				fs.Debugf(b.fs, "Transfer resume")
+				b.paused = true
+				return
 			}
 		}
 	}
+	fs.Debugf(b.fs, "Transfer resume failed")
 }
 
 // Check if the buffer size is less or equal to the buffer size
@@ -790,11 +792,13 @@ func (b *BufferedReaderCloser) CheckLess() {
 		transfer := *_transfer
 		if transfer.GetState() == mega.MegaTransferSTATE_PAUSED {
 			if err := b.fs.setPause(transfer, false); err != nil {
-				b.paused = false
 				fs.Debugf(b.fs, "Transfer pause")
+				b.paused = false
+				return
 			}
 		}
 	}
+	fs.Debugf(b.fs, "Transfer pause failed")
 }
 
 // Read reads up to len(p) bytes into p.
@@ -803,7 +807,7 @@ func (b *BufferedReaderCloser) Read(p []byte) (n int, err error) {
 		time.Sleep(time.Millisecond * 10)
 	}
 
-	if b.closed && len(b.buffer) == 0 {
+	if b.closed /*&& len(b.buffer) == 0*/ {
 		return 0, io.EOF
 	}
 
@@ -826,21 +830,27 @@ func (b *BufferedReaderCloser) Close() error {
 
 	// Ask Mega kindly to stop
 	/*transfer := b.listener.GetTransfer()
-	if transfer != nil && (*transfer).GetState() != mega.MegaTransferSTATE_COMPLETED {
+	if transfer != nil {
 		// TODO: Attach listener to this?
 		b.fs.API().CancelTransfer(*transfer)
 	}*/
-	transfer := b.listener.GetTransfer()
-	if transfer != nil {
-		b.fs.API().CancelTransfer(*transfer)
-	}
-	defer mega.DeleteDirectorMegaTransferListener(*b.listener.director)
+
+	// TODO: Causes crashes?
+	//defer mega.DeleteDirectorMegaTransferListener(*b.listener.director)
 
 	/*
-		2023/10/05 15:07:35 DEBUG : mega root '/memes': File Close
-		2023/10/05 15:07:35 DEBUG : &{video14058428974.mp4 (r)}: >Release: err=<nil>
-		segmentation fault (core dumped)  ./rclone -vvv mount --allow-other --vfs-cache-mode writes test:memes
+		2023/10/05 16:14:21 DEBUG : mega root '/memes': Size video14058428974.mp4
+		2023/10/05 16:14:21 DEBUG : mega root '/memes': File Close
+		2023/10/05 16:14:21 DEBUG : mega root '/memes': File Close 2
+		INFO: Request finished with error -9 - Not found
+		zsh: segmentation fault (core dumped)  ./rclone -vvv mount --allow-other --vfs-cache-mode writes test:memes
 	*/
+
+	// b.listener.Wait()
+	/*merr := b.listener.GetError()
+	if merr != nil && (*merr).GetErrorCode() != mega.MegaErrorAPI_OK {
+		fs.Debugf(b.fs, "MEGA Transfer error: %d - %s", (*merr).GetErrorCode(), (*merr).ToString())
+	}*/
 
 	fs.Debugf(b.fs, "File Close 2")
 
@@ -891,6 +901,8 @@ func (b *BufferedReaderCloser) EOF() {
 		fs.Debugf(b.fs, "MEGA Transfer error EOF: %d - %s", (*merr).GetErrorCode(), (*merr).ToString())
 		b.closed = true
 	}*/
+	/*b.listener.Wait()
+	b.closed = true*/
 }
 
 // Open an object for read
@@ -922,13 +934,22 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 		limit = o.Size() - offset
 	}
 
-	node, err := o.getRef()
+	_node, err := o.getRef()
 	if err != nil {
 		return nil, err
 	}
+	node := (*_node).Copy()
+	fmt.Printf("NAME %s\n", node.GetName())
 
 	// Create listener
 	listenerObj, listener := getTransferListener()
+
+	/* TODO BUG: If mounted read fails
+	2023/10/05 16:41:00 DEBUG : mega root '/memes': File Close
+	2023/10/05 16:41:00 DEBUG : mega root '/memes': File Close 2
+	INFO: Request finished with error -9 - Not found
+	segmentation fault (core dumped)  ./rclone -vvv mount --allow-other --vfs-cache-mode writes test:memes
+	*/
 
 	// 4MB buffer
 	// TODO: Config this?
@@ -959,11 +980,11 @@ func (o *Object) Remove(ctx context.Context) error {
 		return err
 	}
 
-	if !n.IsFile() {
+	if !(*n).IsFile() {
 		return fs.ErrorIsDir
 	}
 
-	if err := o.fs.delete(n); err != nil {
+	if err := o.fs.delete(*n); err != nil {
 		return err
 	}
 
@@ -971,12 +992,12 @@ func (o *Object) Remove(ctx context.Context) error {
 	return nil
 }
 
-func (o *Object) getRef() (node mega.MegaNode, err error) {
-	node = o.fs.API().GetNodeByHandle(o.handle)
+func (o *Object) getRef() (*mega.MegaNode, error) {
+	node := o.fs.API().GetNodeByHandle(o.handle)
 	if node.Swigcptr() == 0 {
-		err = fs.ErrorObjectNotFound
+		return &node, fs.ErrorObjectNotFound
 	}
-	return
+	return &node, nil
 }
 
 // ------------------------------------------------------------
@@ -1051,12 +1072,12 @@ func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object,
 	srcPath, srcName := filepath.Split(absSrc)
 	dstPath, dstName := filepath.Split(absDst)
 	if srcPath != dstPath {
-		if err := f.moveNode(srcNode, *destNode); err != nil {
+		if err := f.moveNode(*srcNode, *destNode); err != nil {
 			return nil, err
 		}
 	}
 	if srcName != dstName {
-		if err := f.renameNode(srcNode, dstName); err != nil {
+		if err := f.renameNode(*srcNode, dstName); err != nil {
 			return nil, err
 		}
 	}
@@ -1225,7 +1246,7 @@ func (o *Object) Size() int64 {
 		return -1
 	}
 
-	return node.GetSize()
+	return (*node).GetSize()
 }
 
 // PublicLink generates a public link to the remote path (usually readable by anyone)
@@ -1285,11 +1306,12 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	f := o.fs
 	fs.Debugf(f, "Update %s", o.Remote())
 
-	parentNode, err := f.mkdirParent(o.remote)
+	_parentNode, err := f.mkdirParent(o.remote)
 	if err != nil && err != fs.ErrorDirExists {
 		fs.Debugf(f, "Parent folder creation failed")
 		return err
 	}
+	parentNode := (*_parentNode).Copy()
 
 	// Create a temporary file
 	// Somebody contact MEGA, ask them for a upload chunks interface :P
@@ -1319,7 +1341,7 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	listenerObj.Reset()
 	f.API().StartUpload(
 		tempFile.Name(),         //Localpath
-		*parentNode,             //Directory
+		parentNode,              //Directory
 		fileName,                //Filename
 		src.ModTime(ctx).Unix(), //Modification time
 		f.opt.Cache,             // Temporary directory
@@ -1363,7 +1385,7 @@ func (o *Object) ModTime(context.Context) time.Time {
 		return time.Unix(0, 0)
 	}
 
-	return intToTime(node.GetModificationTime())
+	return intToTime((*node).GetModificationTime())
 }
 
 // SetModTime sets the modification time of the local fs object
@@ -1385,7 +1407,7 @@ func (o *Object) ID() string {
 		return ""
 	}
 
-	return node.GetBase64Handle()
+	return (*node).GetBase64Handle()
 }
 
 // Check the interfaces are satisfied
