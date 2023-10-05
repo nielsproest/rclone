@@ -1026,44 +1026,46 @@ func (f *Fs) Purge(ctx context.Context, dir string) error {
 // Will only be called if src.Fs().Name() == f.Name()
 //
 // If it isn't possible then return fs.ErrorCantMove
-func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object, error) {
-	fs.Debugf(f, "Move %q -> %q", src.Remote(), remote)
+func (dstFs *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object, error) {
+	fs.Debugf(dstFs, "Move %q -> %q", src.Remote(), remote)
 
 	srcObj, ok := src.(*Object)
 	if !ok {
-		fs.Debugf(f, "Can't move - not same remote type")
+		fs.Debugf(dstFs, "Can't move - not same remote type")
 		return nil, fs.ErrorCantMove
 	}
+	srcFs := srcObj.fs
 
 	srcNode, err := srcObj.getRef()
 	if err != nil {
 		return nil, err
 	}
 
-	dest, err := f.findObject(remote)
+	dest, err := dstFs.findObject(remote)
 	if err == nil && (*dest).IsFile() {
-		fs.Debugf(f, "The destination is an existing file")
+		fs.Debugf(dstFs, "The destination is an existing file")
 		return nil, fs.ErrorIsFile
 	}
 
-	destNode, err := f.mkdirParent(remote)
+	destNode, err := dstFs.mkdirParent(remote)
 	if err != nil && err != fs.ErrorDirExists {
-		fs.Debugf(f, "Destination folder not found")
+		fs.Debugf(dstFs, "Destination folder not found")
 		return nil, err
 	}
 
-	absSrc, _ := f.parsePath(src.Remote())
-	absDst, _ := f.parsePath(remote)
+	absSrc, _ := srcFs.parsePath(src.Remote())
+	absDst, _ := dstFs.parsePath(remote)
+	absSrc = filepath.Join(srcFs.root, absSrc)
+	absDst = filepath.Join(dstFs.root, absDst)
 	srcPath, srcName := filepath.Split(absSrc)
 	dstPath, dstName := filepath.Split(absDst)
-	// TODO: Some bug when mounted
 	if srcPath != dstPath {
-		if err := f.moveNode(*srcNode, *destNode); err != nil {
+		if err := dstFs.moveNode(*srcNode, *destNode); err != nil {
 			return nil, err
 		}
 	}
 	if srcName != dstName {
-		if err := f.renameNode(*srcNode, dstName); err != nil {
+		if err := dstFs.renameNode(*srcNode, dstName); err != nil {
 			return nil, err
 		}
 	}
