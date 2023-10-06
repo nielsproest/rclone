@@ -459,7 +459,12 @@ func (f *Fs) delete(node mega.MegaNode) error {
 			return err
 		}
 	} else {
-		if err := f.moveNode(node, f.API().GetRubbishNode()); err != nil {
+		trashNode := f.API().GetRubbishNode()
+		if trashNode.Swigcptr() == 0 {
+			return fmt.Errorf("trash node was null")
+		}
+
+		if err := f.moveNode(node, trashNode); err != nil {
 			return err
 		}
 	}
@@ -1257,29 +1262,54 @@ func (f *Fs) MergeDirs(ctx context.Context, dirs []fs.Directory) error {
 func (f *Fs) About(ctx context.Context) (*fs.Usage, error) {
 	fs.Debugf(f, "About")
 
-	listenerObj, listener := getRequestListener()
-	defer mega.DeleteDirectorMegaRequestListener(listener)
+	var data mega.MegaRequest
+	{
+		listenerObj, listener := getRequestListener()
+		defer mega.DeleteDirectorMegaRequestListener(listener)
 
-	listenerObj.Reset()
-	f.API().GetAccountDetails(listener)
-	listenerObj.Wait()
+		listenerObj.Reset()
+		f.API().GetAccountDetails(listener)
+		listenerObj.Wait()
 
-	_data := listenerObj.GetRequest()
-	if _data == nil {
-		return nil, fmt.Errorf("GetAccountDetails error")
+		_data := listenerObj.GetRequest()
+		if _data == nil {
+			return nil, fmt.Errorf("GetAccountDetails error")
+		}
+		data = *_data
 	}
-	data := *_data
 
 	if data.GetType() != mega.MegaRequestTYPE_ACCOUNT_DETAILS {
-		return nil, fmt.Errorf("something went wrong %d", data.GetType())
+		return nil, fmt.Errorf("request is wrong type %d != %d", mega.MegaRequestTYPE_ACCOUNT_DETAILS, data.GetType())
 	}
 	account_details := data.GetMegaAccountDetails()
+
+	if account_details.Swigcptr() == 0 {
+		return nil, fmt.Errorf("GetMegaAccountDetails returned null")
+	}
 
 	usage := &fs.Usage{
 		Total: fs.NewUsageValue(account_details.GetStorageMax()),                                    // quota of bytes that can be used
 		Used:  fs.NewUsageValue(account_details.GetStorageUsed()),                                   // bytes in use
 		Free:  fs.NewUsageValue(account_details.GetStorageMax() - account_details.GetStorageUsed()), // bytes which can be uploaded before reaching the quota
 	}
+
+	rootNode := f.API().GetNodeByPath("/")
+	if rootNode.Swigcptr() != 0 {
+		// TODO: Could also be: f.API().GetNumNodes() ?
+		// TODO: Is this on our root or globally (currently its globally)
+		usage.Objects = fs.NewUsageValue(account_details.GetNumFiles(rootNode.GetHandle())) // objects in the storage system
+	}
+
+	trashNode := f.API().GetRubbishNode()
+	if trashNode.Swigcptr() != 0 {
+		usage.Trashed = fs.NewUsageValue(account_details.GetStorageUsed(trashNode.GetHandle())) // bytes in trash
+	}
+
+	vaultNode := f.API().GetVaultNode()
+	if vaultNode.Swigcptr() != 0 {
+		usage.Other = fs.NewUsageValue(account_details.GetStorageUsed(vaultNode.GetHandle())) // other usage e.g. gmail in drive
+	}
+
 	return usage, nil
 }
 
