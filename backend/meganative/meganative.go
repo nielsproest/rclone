@@ -108,13 +108,17 @@ and uploads and downloads can proceed more quickly on very fast connections.`,
 			Default:  2,
 			Advanced: true,
 		}, {
-			Name:     "download_threads",
-			Help:     `Set the maximum number of connections per transfer for downloads`,
+			Name: "download_concurrency",
+			Help: `Set the maximum number of connections per transfer for downloads
+
+The maximum number of allowed connections is 6.`,
 			Default:  3,
 			Advanced: true,
 		}, {
-			Name:     "upload_threads",
-			Help:     `Set the maximum number of connections per transfer for uploads`,
+			Name: "upload_concurrency",
+			Help: `Set the maximum number of connections per transfer for uploads
+
+The maximum number of allowed connections is 6.`,
 			Default:  1,
 			Advanced: true,
 		}, {
@@ -148,8 +152,8 @@ type Options struct {
 	HardDelete      bool                 `config:"hard_delete"`
 	UseHTTPS        bool                 `config:"use_https"`
 	WorkerThreads   int                  `config:"worker_threads"`
-	DownloadThreads int                  `config:"download_threads"`
-	UploadThreads   int                  `config:"upload_threads"`
+	DownloadThreads int                  `config:"download_concurrency"`
+	UploadThreads   int                  `config:"upload_concurrency"`
 	Enc             encoder.MultiEncoder `config:"encoding"`
 }
 
@@ -1273,7 +1277,7 @@ func (f *Fs) About(ctx context.Context) (*fs.Usage, error) {
 
 		_data := listenerObj.GetRequest()
 		if _data == nil {
-			return nil, fmt.Errorf("GetAccountDetails error")
+			return nil, fmt.Errorf("GetAccountDetails request is null")
 		}
 		data = *_data
 	}
@@ -1281,8 +1285,8 @@ func (f *Fs) About(ctx context.Context) (*fs.Usage, error) {
 	if data.GetType() != mega.MegaRequestTYPE_ACCOUNT_DETAILS {
 		return nil, fmt.Errorf("request is wrong type %d != %d", mega.MegaRequestTYPE_ACCOUNT_DETAILS, data.GetType())
 	}
-	account_details := data.GetMegaAccountDetails()
 
+	account_details := data.GetMegaAccountDetails()
 	if account_details.Swigcptr() == 0 {
 		return nil, fmt.Errorf("GetMegaAccountDetails returned null")
 	}
