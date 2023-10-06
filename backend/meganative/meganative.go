@@ -64,12 +64,20 @@ These wont get deleted, so you will have to cleanup manually.`,
 			Default:  "mega_cache",
 			Required: true,
 		}, {
-			Name: "debug",
-			Help: `Output more debug from Mega.
+			Name: "loglevel",
+			Help: `Set the active log level
 
-If this flag is set (along with -vv) it will print further debugging
-information from the mega backend.`,
-			Default:  false,
+These are the valid values for this parameter:
+ - MegaApi::LOG_LEVEL_FATAL = 0
+ - MegaApi::LOG_LEVEL_ERROR = 1
+ - MegaApi::LOG_LEVEL_WARNING = 2
+ - MegaApi::LOG_LEVEL_INFO = 3
+ - MegaApi::LOG_LEVEL_DEBUG = 4
+ - MegaApi::LOG_LEVEL_MAX = 5
+This function sets the log level of the logging system. Any log listener registered by
+MegaApi::addLoggerObject will receive logs with the same or a lower level than
+the one passed to this function.`,
+			Default:  2,
 			Advanced: true,
 		}, {
 			Name: "hard_delete",
@@ -135,7 +143,7 @@ and uploads and downloads can proceed more quickly on very fast connections.`,
 type Options struct {
 	User            string               `config:"user"`
 	Pass            string               `config:"pass"`
-	Debug           bool                 `config:"debug"`
+	LogLevel        int                  `config:"loglevel"`
 	Cache           string               `config:"cache"`
 	HardDelete      bool                 `config:"hard_delete"`
 	UseHTTPS        bool                 `config:"use_https"`
@@ -211,6 +219,13 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		}
 	}
 
+	// Loglevel
+	mega.MegaApiSetLogLevel(opt.LogLevel)
+	mega.MegaApiSetLogToConsole(true) // TODO: Add dedicated logger instead
+	/*loggerObj := MyMegaLogListener{}
+	logger := mega.NewDirectorMegaLogger(&loggerObj)
+	mega.MegaApiAddLoggerObject(logger)*/
+
 	// Used for api calls, not transfers
 	listenerObj, listener := getRequestListener()
 
@@ -223,7 +238,6 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	srv.AddRequestListener(listener)
 
 	// Use HTTPS
-	// TODO: Should i check for errors here?
 	listenerObj.Reset()
 	srv.UseHttpsOnly(opt.UseHTTPS, listener)
 	listenerObj.Wait()
@@ -938,21 +952,9 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 		}
 	}
 
-	/* TODO: Broken when mounted with "--vfs-cache-mode writes" ?
-	2023/10/06 14:18:25 DEBUG : mega root '/memes/video14058428974.mp4': List
-	2023/10/06 14:18:25 DEBUG : mega root '/memes/video14058428974.mp4': findDir
-	2023/10/06 14:18:25 DEBUG : mega root '/memes/video14058428974.mp4': getObject
-	2023/10/06 14:18:25 DEBUG : Local file system at /mnt/newfiles/Work/rclone/fun.mp4: Waiting for checks to finish
-	2023/10/06 14:18:25 DEBUG : Local file system at /mnt/newfiles/Work/rclone/fun.mp4: Waiting for transfers to finish
-	2023/10/06 14:18:25 INFO  : There was nothing to transfer
-	2023/10/06 14:18:25 INFO  :
-	Transferred:              0 B / 0 B, -, 0 B/s, ETA -
-	Elapsed time:         5.4s
+	// TODO: Broken when mounted with "--vfs-cache-mode writes" ?
 
-	2023/10/06 14:18:25 DEBUG : 5 go routines active
-	*/
-
-	// Fixes
+	// Fixes (are the necessary?)
 	if o.Size() < offset {
 		return nil, io.EOF
 	}
