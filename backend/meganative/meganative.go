@@ -221,7 +221,8 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 
 	// Loglevel
 	mega.MegaApiSetLogLevel(opt.LogLevel)
-	mega.MegaApiSetLogToConsole(true) // TODO: Add dedicated logger instead
+	mega.MegaApiSetLogToConsole(true)
+	// TODO: Add dedicated logger instead
 	/*loggerObj := MyMegaLogListener{}
 	logger := mega.NewDirectorMegaLogger(&loggerObj)
 	mega.MegaApiAddLoggerObject(logger)*/
@@ -232,6 +233,8 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 
 	// Used for api calls, not transfers
 	listenerObj, listener := getRequestListener()
+
+	// TODO: mkdir opt.Cache
 
 	// TODO: Generate code at: https://mega.co.nz/#sdk
 	srv := mega.NewMegaApi(
@@ -275,6 +278,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	fs.Logf("mega-native", "Trying log in...")
 
 	listenerObj.Reset()
+	// TODO: multiFactorAuthCheck
 	srv.Login(opt.User, opt.Pass)
 	listenerObj.Wait()
 
@@ -310,7 +314,13 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		return f, nil
 	}
 
-	// TODO BUG: 2023/10/06 14:47:16 ERROR : mega root '/memes': Statfs failed: something went wrong
+	/* TODO: Fix cache bug:
+	[14:37:49][err] Unable to FileAccess::fopen('./mega_cache/jid'): sysstat() failed: error code: 2: No such file or directory
+	2023/10/06 16:37:49 NOTICE: mega-native: Trying log in...
+	[14:37:50][err] Failed to open('./mega_cache/jid'): error 2: No such file or directory
+	[14:37:50][err] [MegaClient::JourneyID::resetCacheAndValues] Unable to remove local cache file
+	[14:37:50][err] [MegaClient::JourneyID::loadValuesFromCache] Unable to load values from the local cache
+	*/
 
 	switch rootNode.GetType() {
 	case mega.MegaNodeTYPE_FOLDER:
@@ -1247,15 +1257,23 @@ func (f *Fs) MergeDirs(ctx context.Context, dirs []fs.Directory) error {
 func (f *Fs) About(ctx context.Context) (*fs.Usage, error) {
 	fs.Debugf(f, "About")
 
-	f.API().GetAccountDetails()
-	(*f.srvListen).Wait()
-	defer (*f.srvListen).Reset()
+	listenerObj, listener := getRequestListener()
+	defer mega.DeleteDirectorMegaRequestListener(listener)
 
-	data := (*f.srvListen).request
-	if (*data).GetType() != mega.MegaRequestTYPE_ACCOUNT_DETAILS {
-		return nil, fmt.Errorf("something went wrong")
+	listenerObj.Reset()
+	f.API().GetAccountDetails(listener)
+	listenerObj.Wait()
+
+	_data := listenerObj.GetRequest()
+	if _data == nil {
+		return nil, fmt.Errorf("GetAccountDetails error")
 	}
-	account_details := (*data).GetMegaAccountDetails()
+	data := *_data
+
+	if data.GetType() != mega.MegaRequestTYPE_ACCOUNT_DETAILS {
+		return nil, fmt.Errorf("something went wrong %d", data.GetType())
+	}
+	account_details := data.GetMegaAccountDetails()
 
 	usage := &fs.Usage{
 		Total: fs.NewUsageValue(account_details.GetStorageMax()),                                    // quota of bytes that can be used
