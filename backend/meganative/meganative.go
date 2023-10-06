@@ -289,6 +289,8 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		return f, nil
 	}
 
+	// TODO BUG: 2023/10/06 14:47:16 ERROR : mega root '/memes': Statfs failed: something went wrong
+
 	switch rootNode.GetType() {
 	case mega.MegaNodeTYPE_FOLDER:
 		// root node found and is a directory
@@ -622,7 +624,6 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 				remote: remote,
 				handle: node.GetHandle(),
 			}
-
 			entries = append(entries, o)
 		}
 	}
@@ -762,9 +763,9 @@ func NewBufferedReaderCloser(bufferSize int) *BufferedReaderCloser {
 }
 
 // Check if the buffer size exceeds double the bufferSize
-func (b *BufferedReaderCloser) CheckExceeds() {
+func (b *BufferedReaderCloser) CheckExceeds() error {
 	if b.paused || len(b.buffer) < b.bufferSize {
-		return
+		return nil
 	}
 
 	_transfer := b.listener.GetTransfer()
@@ -774,17 +775,19 @@ func (b *BufferedReaderCloser) CheckExceeds() {
 			if err := b.fs.setPause(transfer, true); err != nil {
 				fs.Debugf(b.fs, "Transfer resume")
 				b.paused = true
-				return
+			} else {
+				return fmt.Errorf("transfer resume failed")
 			}
 		}
 	}
-	fs.Debugf(b.fs, "Transfer resume failed")
+
+	return nil
 }
 
 // Check if the buffer size is less or equal to the buffer size
-func (b *BufferedReaderCloser) CheckLess() {
+func (b *BufferedReaderCloser) CheckLess() error {
 	if !b.paused || len(b.buffer) > b.bufferSize/2 {
-		return
+		return nil
 	}
 
 	_transfer := b.listener.GetTransfer()
@@ -794,59 +797,12 @@ func (b *BufferedReaderCloser) CheckLess() {
 			if err := b.fs.setPause(transfer, false); err != nil {
 				fs.Debugf(b.fs, "Transfer pause")
 				b.paused = false
-				return
+			} else {
+				return fmt.Errorf("transfer pause failed")
 			}
 		}
 	}
-	fs.Debugf(b.fs, "Transfer pause failed")
-}
 
-// Read reads up to len(p) bytes into p.
-func (b *BufferedReaderCloser) Read(p []byte) (n int, err error) {
-	for len(b.buffer) == 0 && !b.closed {
-		time.Sleep(time.Millisecond * 10)
-	}
-
-	if b.closed /*&& len(b.buffer) == 0*/ {
-		return 0, io.EOF
-	}
-
-	b.bufferMu.Lock()
-	defer b.bufferMu.Unlock()
-
-	n = copy(p, b.buffer)
-	b.buffer = b.buffer[n:]
-	b.CheckLess()
-
-	return n, nil
-}
-
-// Close closed the file - MAC errors are reported here
-func (b *BufferedReaderCloser) Close() error {
-	b.bufferMu.Lock()
-	defer b.bufferMu.Unlock()
-
-	fs.Debugf(b.fs, "File Close Start")
-
-	// Ask Mega kindly to stop
-	transfer := b.listener.GetTransfer()
-	if transfer != nil && ((*transfer).GetState() == mega.MegaTransferSTATE_ACTIVE || (*transfer).GetState() == mega.MegaTransferSTATE_PAUSED) {
-		// TODO: Without a dedicated listener, it writes to the transfer listener
-		b.fs.API().CancelTransfer(*transfer)
-	}
-
-	// TODO: Causes crashes?
-	//defer mega.DeleteDirectorMegaTransferListener(*b.listener.director)
-
-	// b.listener.Wait()
-	/*merr := b.listener.GetError()
-	if merr != nil && (*merr).GetErrorCode() != mega.MegaErrorAPI_OK {
-		fs.Debugf(b.fs, "MEGA Transfer error: %d - %s", (*merr).GetErrorCode(), (*merr).ToString())
-	}*/
-
-	fs.Debugf(b.fs, "File Close End")
-
-	b.closed = true
 	return nil
 }
 
@@ -860,9 +816,82 @@ func (f *Fs) setPause(signal mega.MegaTransfer, paused bool) error {
 	listenerObj.Wait()
 
 	if merr := getMegaError(listenerObj); merr != nil && merr.GetErrorCode() != mega.MegaErrorAPI_OK {
-		return fmt.Errorf("MEGA SetPause root error: %d - %s", merr.GetErrorCode(), merr.ToString())
+		return fmt.Errorf("SetPause error: %d - %s", merr.GetErrorCode(), merr.ToString())
 	}
 
+	return nil
+}
+
+// Set the pause state of a transfer
+func (f *Fs) cancelTransfer(signal mega.MegaTransfer) error {
+	listenerObj, listener := getRequestListener()
+	defer mega.DeleteDirectorMegaRequestListener(listener)
+
+	listenerObj.Reset()
+	f.API().CancelTransfer(signal, listener)
+	listenerObj.Wait()
+
+	if merr := getMegaError(listenerObj); merr != nil && merr.GetErrorCode() != mega.MegaErrorAPI_OK {
+		return fmt.Errorf("CancelTransfer error: %d - %s", merr.GetErrorCode(), merr.ToString())
+	}
+
+	return nil
+}
+
+// Read reads up to len(p) bytes into p.
+func (b *BufferedReaderCloser) Read(p []byte) (n int, err error) {
+	for len(b.buffer) == 0 && !b.closed {
+		time.Sleep(time.Millisecond * 10)
+	}
+
+	if b.closed && len(b.buffer) == 0 {
+		return 0, io.EOF
+	}
+
+	b.bufferMu.Lock()
+	defer b.bufferMu.Unlock()
+
+	n = copy(p, b.buffer)
+	b.buffer = b.buffer[n:]
+	if err := b.CheckLess(); err != nil {
+		fs.Errorf(b.fs, "%s", err.Error())
+	}
+
+	return n, nil
+}
+
+// Close closed the file - MAC errors are reported here
+func (b *BufferedReaderCloser) Close() error {
+	b.bufferMu.Lock()
+	defer b.bufferMu.Unlock()
+
+	fs.Debugf(b.fs, "File Close Start")
+
+	// Ask Mega kindly to stop
+	transfer := b.listener.GetTransfer()
+	if transfer != nil {
+		switch state := (*transfer).GetState(); state {
+		case mega.MegaTransferSTATE_ACTIVE,
+			mega.MegaTransferSTATE_PAUSED,
+			mega.MegaTransferSTATE_RETRYING,
+			mega.MegaTransferSTATE_QUEUED:
+			if err := b.fs.cancelTransfer(*transfer); err != nil {
+				fs.Errorf(b.fs, "Cancel transfer error: %s", err.Error())
+			}
+		}
+	}
+
+	// TODO: Causes crashes?
+	//defer mega.DeleteDirectorMegaTransferListener(*b.listener.director)
+
+	// b.listener.Wait()
+	if merr := b.listener.GetError(); merr != nil && (*merr).GetErrorCode() != mega.MegaErrorAPI_OK {
+		fs.Debugf(b.fs, "Transfer error: %d - %s", (*merr).GetErrorCode(), (*merr).ToString())
+	}
+
+	fs.Debugf(b.fs, "File Close End")
+
+	b.closed = true
 	return nil
 }
 
@@ -875,7 +904,9 @@ func (b *BufferedReaderCloser) WriteToBuffer(data []byte) error {
 		return io.ErrClosedPipe
 	}
 	b.buffer = append(b.buffer, data...)
-	b.CheckExceeds()
+	if err := b.CheckExceeds(); err != nil {
+		fs.Errorf(b.fs, "%s", err.Error())
+	}
 
 	return nil
 }
@@ -886,15 +917,7 @@ func (b *BufferedReaderCloser) EOF() {
 	defer b.bufferMu.Unlock()
 
 	fs.Debugf(b.fs, "File EOF")
-
-	/*b.listener.Wait()
-	merr := b.listener.GetError()
-	if merr != nil && (*merr).GetErrorCode() != mega.MegaErrorAPI_OK {
-		fs.Debugf(b.fs, "MEGA Transfer error EOF: %d - %s", (*merr).GetErrorCode(), (*merr).ToString())
-		b.closed = true
-	}*/
-	/*b.listener.Wait()
-	b.closed = true*/
+	b.closed = true
 }
 
 // Open an object for read
@@ -915,8 +938,22 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 		}
 	}
 
+	/* TODO: Broken when mounted with "--vfs-cache-mode writes" ?
+	2023/10/06 14:18:25 DEBUG : mega root '/memes/video14058428974.mp4': List
+	2023/10/06 14:18:25 DEBUG : mega root '/memes/video14058428974.mp4': findDir
+	2023/10/06 14:18:25 DEBUG : mega root '/memes/video14058428974.mp4': getObject
+	2023/10/06 14:18:25 DEBUG : Local file system at /mnt/newfiles/Work/rclone/fun.mp4: Waiting for checks to finish
+	2023/10/06 14:18:25 DEBUG : Local file system at /mnt/newfiles/Work/rclone/fun.mp4: Waiting for transfers to finish
+	2023/10/06 14:18:25 INFO  : There was nothing to transfer
+	2023/10/06 14:18:25 INFO  :
+	Transferred:              0 B / 0 B, -, 0 B/s, ETA -
+	Elapsed time:         5.4s
+
+	2023/10/06 14:18:25 DEBUG : 5 go routines active
+	*/
+
 	// Fixes
-	if o.Size() <= offset {
+	if o.Size() < offset {
 		return nil, io.EOF
 	}
 	if 0 > offset {
@@ -936,9 +973,9 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 	// Create listener
 	listenerObj, listener := getTransferListener()
 
-	// 4MB buffer
+	// 64MB buffer
 	// TODO: Config this?
-	reader := NewBufferedReaderCloser(1024 * 1024 * 4)
+	reader := NewBufferedReaderCloser(1024 * 1024 * 64)
 	listenerObj.out = reader
 	reader.fs = o.fs
 	reader.listener = listenerObj

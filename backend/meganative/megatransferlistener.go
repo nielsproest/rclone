@@ -47,12 +47,6 @@ func (l *MyMegaTransferListener) OnTransferFinish(api mega.MegaApi, transfer meg
 	}
 }
 
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
 func (l *MyMegaTransferListener) OnTransferData(api mega.MegaApi, transfer mega.MegaTransfer, buffer string) bool {
 	if l.out != nil && len(buffer) > 0 {
 		buf := []byte(buffer)
