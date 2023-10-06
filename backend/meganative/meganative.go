@@ -226,6 +226,10 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	logger := mega.NewDirectorMegaLogger(&loggerObj)
 	mega.MegaApiAddLoggerObject(logger)*/
 
+	// Dont use multithreaded streams, MEGA-SDK is already multi-threaded
+	ci := fs.GetConfig(ctx)
+	ci.MultiThreadStreams = 0
+
 	// Used for api calls, not transfers
 	listenerObj, listener := getRequestListener()
 
@@ -236,6 +240,9 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		"MEGA/SDK Rclone filesystem", // userAgent
 		uint(opt.WorkerThreads))      // workerThreadCount
 	srv.AddRequestListener(listener)
+	// TODO: virtual void onReloadNeeded(MegaApi* api);
+	// If inconsitent state this is called on listener
+	// refresh root etc.
 
 	// Use HTTPS
 	listenerObj.Reset()
@@ -953,8 +960,34 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 	}
 
 	// TODO: Broken when mounted with "--vfs-cache-mode writes" ?
+	/*
+		[14:25:23][warn] REQ_FAILURE. Status: 429 CURLcode: 22  Content-Length: -1  buffer? 0  bufferSize: 0
+		[14:25:23][warn] DirectReadSlot [conn 0] Request status is FAILURE [Request status = 9, HTTP status = 429] [this = 0x7fac979f9bb0]
+		[14:25:23][warn] [DirectReadNode::retry] Streaming transfer retry due to error -21 [this = 0x7fac947f6df0]
+		[14:25:23][warn] REQ_FAILURE. Status: 429 CURLcode: 22  Content-Length: -1  buffer? 0  bufferSize: 0
+		[14:25:23][warn] DirectReadSlot [conn 0] Request status is FAILURE [Request status = 9, HTTP status = 429] [this = 0x7fac948586a0]
+		[14:25:23][warn] [DirectReadNode::retry] Streaming transfer retry due to error -21 [this = 0x7fac947f6df0]
+		[14:25:24][warn] REQ_FAILURE. Status: 429 CURLcode: 22  Content-Length: -1  buffer? 0  bufferSize: 0
+		[14:25:24][warn] REQ_FAILURE. Status: 429 CURLcode: 22  Content-Length: -1  buffer? 0  bufferSize: 0
+		[14:25:24][warn] DirectReadSlot [conn 0] Request status is FAILURE [Request status = 9, HTTP status = 429] [this = 0x7fac979f9bb0]
+		[14:25:24][warn] [DirectReadNode::retry] Streaming transfer retry due to error -21 [this = 0x7fac947f6df0]
+		[14:25:24][warn] REQ_FAILURE. Status: 429 CURLcode: 22  Content-Length: -1  buffer? 0  bufferSize: 0
+		[14:25:24][warn] REQ_FAILURE. Status: 429 CURLcode: 22  Content-Length: -1  buffer? 0  bufferSize: 0
+		[14:25:24][warn] DirectReadSlot [conn 0] Request status is FAILURE [Request status = 9, HTTP status = 429] [this = 0x7fac979fad40]
+		[14:25:24][warn] [DirectReadNode::retry] Streaming transfer retry due to error -21 [this = 0x7fac947f6df0]
+		[14:25:25][warn] REQ_FAILURE. Status: 429 CURLcode: 22  Content-Length: -1  buffer? 0  bufferSize: 0
+		[14:25:25][warn] DirectReadSlot [conn 0] Request status is FAILURE [Request status = 9, HTTP status = 429] [this = 0x7fac9484ffa0]
+		[14:25:25][warn] [DirectReadNode::retry] Streaming transfer retry due to error -21 [this = 0x7fac947f6df0]
+		[14:25:27][warn] REQ_FAILURE. Status: 429 CURLcode: 22  Content-Length: -1  buffer? 0  bufferSize: 0
+		[14:25:27][warn] REQ_FAILURE. Status: 429 CURLcode: 22  Content-Length: -1  buffer? 0  bufferSize: 0
+		[14:25:27][warn] DirectReadSlot [conn 0] Request status is FAILURE [Request status = 9, HTTP status = 429] [this = 0x7fac94850340]
+		[14:25:27][warn] [DirectReadNode::retry] Streaming transfer retry due to error -21 [this = 0x7fac947f6df0]
+		[14:25:31][warn] REQ_FAILURE. Status: 429 CURLcode: 22  Content-Length: -1  buffer? 0  bufferSize: 0
+		[14:25:31][warn] DirectReadSlot [conn 0] Request status is FAILURE [Request status = 9, HTTP status = 429] [this = 0x7fac97a0b770]
+		[14:25:31][warn] [DirectReadNode::retry] Streaming transfer retry due to error -21 [this = 0x7fac947f6df0]
+	*/
 
-	// Fixes (are the necessary?)
+	// Fixes (are they necessary?)
 	if o.Size() < offset {
 		return nil, io.EOF
 	}
