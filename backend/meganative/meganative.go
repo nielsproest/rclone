@@ -28,8 +28,6 @@ import (
  * Resolve all TODO's.
  * Test all functionality (use rclone test functions also).
  * Remove the dozen of debug calls (or make them proper debug calls with the debug fs flag),
- * actually i should find if MEGA has optional debug flags i can set.
- * Potentially find a better upload method.
  * Remove unnecessary pointers
  *
  * But most importantly at the end:
@@ -42,7 +40,7 @@ func init() {
 		Name: "mega_native",
 		Description: `Mega Native.
 
-The MEGA-SDK using the original C++ SDK's library.`,
+The Rclone backend using the original C++ MEGA-SDK library.`,
 		NewFs: NewFs,
 		Options: []fs.Option{{
 			Name:      "user",
@@ -58,10 +56,9 @@ The MEGA-SDK using the original C++ SDK's library.`,
 			Name: "cache",
 			Help: `MEGA State cache folder.
 
-TODO: Rclone already has a cache?
 Where to put MEGA state files.
 These wont get deleted, so you will have to cleanup manually.`,
-			Default:  "mega_cache",
+			Default:  "mega_cache", // TODO: Rclone already has a cache?
 			Required: true,
 		}, {
 			Name: "loglevel",
@@ -84,19 +81,22 @@ the one passed to this function.`,
 			Help: `Delete files permanently rather than putting them into the trash.
 
 Normally the mega backend will put all deletions into the trash rather
-than permanently deleting them.  If you specify this then rclone will
+than permanently deleting them. If you specify this then rclone will
 permanently delete objects instead.`,
 			Default:  false,
 			Advanced: true,
 		}, {
 			Name: "use_https",
-			Help: `Use HTTPS for transfers.
+			Help: `Use HTTPS communications only
 
-MEGA uses plain text HTTP connections by default.
-Some ISPs throttle HTTP connections, this causes transfers to become very slow.
-Enabling this will force MEGA to use HTTPS for all transfers.
-HTTPS is normally not necessary since all data is already encrypted anyway.
-Enabling it will increase CPU usage and add network overhead.`,
+The default behavior is to use HTTP for transfers and the persistent connection
+to wait for external events. Those communications don't require HTTPS because
+all transfer data is already end-to-end encrypted and no data is transmitted
+over the connection to wait for events (it's just closed when there are new events).
+
+This feature should only be enabled if there are problems to contact MEGA servers
+through HTTP because otherwise it doesn't have any benefit and will cause a
+higher CPU usage.`,
 			Default:  false,
 			Advanced: true,
 		}, {
@@ -106,6 +106,11 @@ Enabling it will increase CPU usage and add network overhead.`,
 Using worker threads means that synchronous function calls on MegaApi will be blocked less,
 and uploads and downloads can proceed more quickly on very fast connections.`,
 			Default:  2,
+			Advanced: true,
+		}, {
+			Name:     "download_cache",
+			Help:     `Sets how big the download cache should be in MB`,
+			Default:  64,
 			Advanced: true,
 		}, {
 			Name: "download_concurrency",
@@ -152,6 +157,7 @@ type Options struct {
 	HardDelete      bool                 `config:"hard_delete"`
 	UseHTTPS        bool                 `config:"use_https"`
 	WorkerThreads   int                  `config:"worker_threads"`
+	DownloadCache   int                  `config:"download_cache"`
 	DownloadThreads int                  `config:"download_concurrency"`
 	UploadThreads   int                  `config:"upload_concurrency"`
 	Enc             encoder.MultiEncoder `config:"encoding"`
@@ -1006,7 +1012,7 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 		[14:25:31][warn] [DirectReadNode::retry] Streaming transfer retry due to error -21 [this = 0x7fac947f6df0]
 	*/
 
-	// Fixes (are they necessary?)
+	// Fixes (TODO: are they necessary?)
 	if o.Size() < offset {
 		return nil, io.EOF
 	}
@@ -1027,9 +1033,8 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 	// Create listener
 	listenerObj, listener := getTransferListener()
 
-	// 64MB buffer
-	// TODO: Config this?
-	reader := NewBufferedReaderCloser(1024 * 1024 * 64)
+	// Buffer
+	reader := NewBufferedReaderCloser(1024 * 1024 * o.fs.opt.DownloadCache)
 	listenerObj.out = reader
 	reader.fs = o.fs
 	reader.listener = listenerObj
@@ -1042,12 +1047,7 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 
 // ------------------------------------------------------------
 
-// Purge all files in the directory specified
-//
-// Implement this if you have a way of deleting all the files
-// quicker than just running Remove() on the result of List()
-//
-// Return an error if it doesn't exist
+// Remove an object
 func (o *Object) Remove(ctx context.Context) error {
 	fs.Debugf(o.fs, "Remove %s", o.Remote())
 
@@ -1248,13 +1248,11 @@ func (f *Fs) MergeDirs(ctx context.Context, dirs []fs.Directory) error {
 			if err := f.moveNode(node, dstNode); err != nil {
 				return err
 			}
-
-			// TODO: Is this correct
-			if err := f.delete(node); err != nil {
-				return err
-			}
 		}
 
+		if err := f.delete(srcNode); err != nil {
+			return err
+		}
 	}
 
 	return nil
@@ -1297,7 +1295,7 @@ func (f *Fs) About(ctx context.Context) (*fs.Usage, error) {
 		Free:  fs.NewUsageValue(account_details.GetStorageMax() - account_details.GetStorageUsed()), // bytes which can be uploaded before reaching the quota
 	}
 
-	rootNode := f.API().GetNodeByPath("/")
+	rootNode := f.API().GetRootNode()
 	if rootNode.Swigcptr() != 0 {
 		// TODO: Could also be: f.API().GetNumNodes() ?
 		// TODO: Is this on our root or globally (currently its globally)
