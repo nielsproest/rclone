@@ -16,6 +16,7 @@ type BufferWriter interface {
 }
 
 type MyMegaTransferListener struct {
+	// mega.SwigDirector_MegaTransferListener
 	mega.SwigDirector_MegaTransferListener
 	notified bool
 	err      *mega.MegaError
@@ -36,23 +37,47 @@ func (l *MyMegaTransferListener) OnTransferFinish(api mega.MegaApi, transfer meg
 		fmt.Printf("INFO: Transfer finished with error %d - %s\n", err.GetErrorCode(), err.ToString())
 	}
 
-	l.m.Lock()
-	defer l.m.Unlock()
+	{
+		l.m.Lock()
+		defer l.m.Unlock()
 
-	l.notified = true
-	l.cv.Broadcast()
+		l.notified = true
+		l.cv.Broadcast()
 
-	if l.out != nil {
-		l.out.EOF()
+		if l.out != nil {
+			l.out.EOF()
+		}
 	}
 }
 
+// Only called when "streaming"
 func (l *MyMegaTransferListener) OnTransferData(api mega.MegaApi, transfer mega.MegaTransfer, buffer string) bool {
 	if l.out != nil && len(buffer) > 0 {
 		buf := []byte(buffer)
 		l.out.WriteToBuffer(buf)
 	}
+
+	if !l.notified {
+		req := transfer.Copy()
+		l.transfer = &req
+
+		tr := transfer.GetLastError()
+		if tr.Swigcptr() != 0 {
+			err := tr.Copy()
+			l.err = &err
+		}
+
+		l.m.Lock()
+		defer l.m.Unlock()
+
+		l.notified = true
+		l.cv.Broadcast()
+	}
+
 	return true
+}
+
+func (l *MyMegaTransferListener) OnTransferUpdate(api mega.MegaApi, transfer mega.MegaTransfer) {
 }
 
 func (l *MyMegaTransferListener) GetError() *mega.MegaError {

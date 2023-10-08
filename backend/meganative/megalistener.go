@@ -36,6 +36,7 @@ func (l *MyMegaListener) OnRequestFinish(api mega.MegaApi, request mega.MegaRequ
 	case mega.MegaRequestTYPE_FETCH_NODES:
 		node := api.GetRootNode()
 		l.cwd = &node
+		// TODO: Refetch our root also?
 	}
 
 	l.notified = true
@@ -48,6 +49,10 @@ func (l *MyMegaListener) OnNodesUpdate(api mega.MegaApi, nodes mega.MegaNodeList
 		node := api.GetRootNode()
 		l.cwd = &node
 	}
+}
+
+func (l *MyMegaListener) OnReloadNeeded(api mega.MegaApi) {
+	api.FetchNodes()
 }
 
 func (l *MyMegaListener) GetError() *mega.MegaError {

@@ -18,8 +18,10 @@ import (
 	"github.com/rclone/rclone/fs/config/configmap"
 	"github.com/rclone/rclone/fs/config/configstruct"
 	"github.com/rclone/rclone/fs/config/obscure"
+	"github.com/rclone/rclone/fs/fserrors"
 	"github.com/rclone/rclone/fs/hash"
 	"github.com/rclone/rclone/lib/encoder"
+	"github.com/rclone/rclone/lib/pacer"
 	"github.com/rclone/rclone/lib/readers"
 )
 
@@ -33,6 +35,13 @@ import (
  * But most importantly at the end:
  * Find a way to ship this thing
  */
+
+const (
+	minSleep      = 10 * time.Millisecond
+	maxSleep      = 2 * time.Second
+	eventWaitTime = 500 * time.Millisecond
+	decayConstant = 2 // bigger for slower decay, exponential
+)
 
 // Register with Fs
 func init() {
@@ -108,8 +117,11 @@ and uploads and downloads can proceed more quickly on very fast connections.`,
 			Default:  2,
 			Advanced: true,
 		}, {
-			Name:     "download_cache",
-			Help:     `Sets how big the download cache should be in MB`,
+			Name: "download_cache",
+			Help: `Sets how big the download cache should be in MB
+
+The minimum is 1, but this will make your transfers really slow.
+It is recommended to keep it above 32`,
 			Default:  64,
 			Advanced: true,
 		}, {
@@ -117,7 +129,7 @@ and uploads and downloads can proceed more quickly on very fast connections.`,
 			Help: `Set the maximum number of connections per transfer for downloads
 
 The maximum number of allowed connections is 6.`,
-			Default:  3,
+			Default:  1,
 			Advanced: true,
 		}, {
 			Name: "upload_concurrency",
@@ -172,6 +184,7 @@ type Fs struct {
 	features  *fs.Features    // optional features
 	srv       *mega.MegaApi   // the connection to the server
 	srvListen *MyMegaListener // the request listener
+	pacer     *fs.Pacer       // pacer for API calls
 }
 
 // Object describes a mega object
@@ -244,7 +257,20 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	// Used for api calls, not transfers
 	listenerObj, listener := getRequestListener()
 
-	// TODO: mkdir opt.Cache
+	// Check if the directory exists
+	_, err = os.Stat(opt.Cache)
+	// If the directory doesn't exist, create it
+	if os.IsNotExist(err) {
+		err := os.MkdirAll(opt.Cache, 0755) // 0755 sets the directory permissions
+		if err != nil {
+			return nil, fmt.Errorf("error creating directory: %s", err.Error())
+		}
+		fs.Debugf("mega-native", "Directory created: %s", opt.Cache)
+	} else if err != nil {
+		return nil, fmt.Errorf("error checking directory: %s", err.Error())
+	} else {
+		fs.Debugf("mega-native", "Directory already exists: %s", opt.Cache)
+	}
 
 	// TODO: Generate code at: https://mega.co.nz/#sdk
 	srv := mega.NewMegaApi(
@@ -253,9 +279,6 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		"MEGA/SDK Rclone filesystem", // userAgent
 		uint(opt.WorkerThreads))      // workerThreadCount
 	srv.AddRequestListener(listener)
-	// TODO: virtual void onReloadNeeded(MegaApi* api);
-	// If inconsitent state this is called on listener
-	// refresh root etc.
 
 	// Use HTTPS
 	listenerObj.Reset()
@@ -308,6 +331,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		opt:       *opt,
 		srv:       &srv,
 		srvListen: listenerObj,
+		pacer:     fs.NewPacer(ctx, pacer.NewDefault(pacer.MinSleep(minSleep), pacer.MaxSleep(maxSleep), pacer.DecayConstant(decayConstant))),
 	}
 	f.features = (&fs.Features{
 		DuplicateFiles:          true,
@@ -365,6 +389,16 @@ func getMegaError(listener *MyMegaListener) mega.MegaError {
 // Just a macro
 func (f *Fs) API() mega.MegaApi {
 	return *f.srv
+}
+
+// shouldRetry returns a boolean as to whether this err deserves to be
+// retried.  It returns the err as a convenience
+func shouldRetry(ctx context.Context, err error) (bool, error) {
+	if fserrors.ContextError(ctx, &err) {
+		return false, err
+	}
+	// Let the mega library handle the low level retries
+	return false, err
 }
 
 // Converts any mega unix time to time.Time
@@ -868,30 +902,14 @@ func (f *Fs) setPause(signal mega.MegaTransfer, paused bool) error {
 	return nil
 }
 
-// Set the pause state of a transfer
-func (f *Fs) cancelTransfer(signal mega.MegaTransfer) error {
-	listenerObj, listener := getRequestListener()
-	defer mega.DeleteDirectorMegaRequestListener(listener)
-
-	listenerObj.Reset()
-	f.API().CancelTransfer(signal, listener)
-	listenerObj.Wait()
-
-	if merr := getMegaError(listenerObj); merr != nil && merr.GetErrorCode() != mega.MegaErrorAPI_OK {
-		return fmt.Errorf("CancelTransfer error: %d - %s", merr.GetErrorCode(), merr.ToString())
-	}
-
-	return nil
-}
-
 // Read reads up to len(p) bytes into p.
 func (b *BufferedReaderCloser) Read(p []byte) (n int, err error) {
-	for len(b.buffer) == 0 && !b.closed {
-		time.Sleep(time.Millisecond * 10)
-	}
+	for len(b.buffer) == 0 {
+		if b.closed {
+			return 0, io.EOF
+		}
 
-	if b.closed && len(b.buffer) == 0 {
-		return 0, io.EOF
+		time.Sleep(time.Millisecond * 1)
 	}
 
 	b.bufferMu.Lock()
@@ -916,23 +934,17 @@ func (b *BufferedReaderCloser) Close() error {
 	// Ask Mega kindly to stop
 	transfer := b.listener.GetTransfer()
 	if transfer != nil {
-		switch state := (*transfer).GetState(); state {
-		case mega.MegaTransferSTATE_ACTIVE,
-			mega.MegaTransferSTATE_PAUSED,
-			mega.MegaTransferSTATE_RETRYING,
-			mega.MegaTransferSTATE_QUEUED:
-			if err := b.fs.cancelTransfer(*transfer); err != nil {
-				fs.Errorf(b.fs, "Cancel transfer error: %s", err.Error())
-			}
+		_transfer := *transfer
+		if _transfer.Swigcptr() != 0 {
+			b.fs.API().CancelTransfer(_transfer)
 		}
 	}
 
 	// TODO: Causes crashes?
 	//defer mega.DeleteDirectorMegaTransferListener(*b.listener.director)
 
-	// b.listener.Wait()
 	if merr := b.listener.GetError(); merr != nil && (*merr).GetErrorCode() != mega.MegaErrorAPI_OK {
-		fs.Debugf(b.fs, "Transfer error: %d - %s", (*merr).GetErrorCode(), (*merr).ToString())
+		fs.Errorf(b.fs, "Transfer error: %d - %s", (*merr).GetErrorCode(), (*merr).ToString())
 	}
 
 	fs.Debugf(b.fs, "File Close End")
@@ -985,43 +997,21 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 	}
 
 	// TODO: Broken when mounted with "--vfs-cache-mode writes" ?
-	/*
-		[14:25:23][warn] REQ_FAILURE. Status: 429 CURLcode: 22  Content-Length: -1  buffer? 0  bufferSize: 0
-		[14:25:23][warn] DirectReadSlot [conn 0] Request status is FAILURE [Request status = 9, HTTP status = 429] [this = 0x7fac979f9bb0]
-		[14:25:23][warn] [DirectReadNode::retry] Streaming transfer retry due to error -21 [this = 0x7fac947f6df0]
-		[14:25:23][warn] REQ_FAILURE. Status: 429 CURLcode: 22  Content-Length: -1  buffer? 0  bufferSize: 0
-		[14:25:23][warn] DirectReadSlot [conn 0] Request status is FAILURE [Request status = 9, HTTP status = 429] [this = 0x7fac948586a0]
-		[14:25:23][warn] [DirectReadNode::retry] Streaming transfer retry due to error -21 [this = 0x7fac947f6df0]
-		[14:25:24][warn] REQ_FAILURE. Status: 429 CURLcode: 22  Content-Length: -1  buffer? 0  bufferSize: 0
-		[14:25:24][warn] REQ_FAILURE. Status: 429 CURLcode: 22  Content-Length: -1  buffer? 0  bufferSize: 0
-		[14:25:24][warn] DirectReadSlot [conn 0] Request status is FAILURE [Request status = 9, HTTP status = 429] [this = 0x7fac979f9bb0]
-		[14:25:24][warn] [DirectReadNode::retry] Streaming transfer retry due to error -21 [this = 0x7fac947f6df0]
-		[14:25:24][warn] REQ_FAILURE. Status: 429 CURLcode: 22  Content-Length: -1  buffer? 0  bufferSize: 0
-		[14:25:24][warn] REQ_FAILURE. Status: 429 CURLcode: 22  Content-Length: -1  buffer? 0  bufferSize: 0
-		[14:25:24][warn] DirectReadSlot [conn 0] Request status is FAILURE [Request status = 9, HTTP status = 429] [this = 0x7fac979fad40]
-		[14:25:24][warn] [DirectReadNode::retry] Streaming transfer retry due to error -21 [this = 0x7fac947f6df0]
-		[14:25:25][warn] REQ_FAILURE. Status: 429 CURLcode: 22  Content-Length: -1  buffer? 0  bufferSize: 0
-		[14:25:25][warn] DirectReadSlot [conn 0] Request status is FAILURE [Request status = 9, HTTP status = 429] [this = 0x7fac9484ffa0]
-		[14:25:25][warn] [DirectReadNode::retry] Streaming transfer retry due to error -21 [this = 0x7fac947f6df0]
-		[14:25:27][warn] REQ_FAILURE. Status: 429 CURLcode: 22  Content-Length: -1  buffer? 0  bufferSize: 0
-		[14:25:27][warn] REQ_FAILURE. Status: 429 CURLcode: 22  Content-Length: -1  buffer? 0  bufferSize: 0
-		[14:25:27][warn] DirectReadSlot [conn 0] Request status is FAILURE [Request status = 9, HTTP status = 429] [this = 0x7fac94850340]
-		[14:25:27][warn] [DirectReadNode::retry] Streaming transfer retry due to error -21 [this = 0x7fac947f6df0]
-		[14:25:31][warn] REQ_FAILURE. Status: 429 CURLcode: 22  Content-Length: -1  buffer? 0  bufferSize: 0
-		[14:25:31][warn] DirectReadSlot [conn 0] Request status is FAILURE [Request status = 9, HTTP status = 429] [this = 0x7fac97a0b770]
-		[14:25:31][warn] [DirectReadNode::retry] Streaming transfer retry due to error -21 [this = 0x7fac947f6df0]
-	*/
+	// Windows seems to like opening the file MANY times?
 
-	// Fixes (TODO: are they necessary?)
-	if o.Size() < offset {
+	// Fixes
+	if o.Size() <= offset {
 		return nil, io.EOF
 	}
 	if 0 > offset {
 		offset = 0
 	}
-	if 0 > limit || limit+offset > o.Size() {
+	if 0 >= limit || limit+offset > o.Size() {
 		limit = o.Size() - offset
 	}
+
+	// TODO BUG: vfs cache: stopping download thread as it timed out
+	// If you skip in video even if vfs-cache-mode full
 
 	_node, err := o.getRef()
 	if err != nil {
@@ -1041,6 +1031,11 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 
 	listenerObj.Reset()
 	o.fs.API().StartStreaming(node, offset, limit, listener)
+	listenerObj.Wait()
+
+	if merr := listenerObj.GetError(); merr != nil && (*merr).GetErrorCode() != mega.MegaErrorAPI_OK {
+		return nil, fmt.Errorf("transfer error: %d - %s", (*merr).GetErrorCode(), (*merr).ToString())
+	}
 
 	return readers.NewLimitedReadCloser(reader, limit), nil
 }
