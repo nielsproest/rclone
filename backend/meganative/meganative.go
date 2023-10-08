@@ -19,10 +19,8 @@ import (
 	"github.com/rclone/rclone/fs/config/configmap"
 	"github.com/rclone/rclone/fs/config/configstruct"
 	"github.com/rclone/rclone/fs/config/obscure"
-	"github.com/rclone/rclone/fs/fserrors"
 	"github.com/rclone/rclone/fs/hash"
 	"github.com/rclone/rclone/lib/encoder"
-	"github.com/rclone/rclone/lib/pacer"
 	"github.com/rclone/rclone/lib/readers"
 )
 
@@ -36,13 +34,6 @@ import (
  * But most importantly at the end:
  * Find a way to ship this thing
  */
-
-const (
-	minSleep      = 10 * time.Millisecond
-	maxSleep      = 2 * time.Second
-	eventWaitTime = 500 * time.Millisecond
-	decayConstant = 2 // bigger for slower decay, exponential
-)
 
 // Register with Fs
 func init() {
@@ -126,17 +117,13 @@ It is recommended to keep it above 32`,
 			Default:  64,
 			Advanced: true,
 		}, {
-			Name: "download_concurrency",
-			Help: `Set the maximum number of connections per transfer for downloads
-
-The maximum number of allowed connections is 6.`,
-			Default:  1,
+			Name:     "download_concurrency",
+			Help:     `Set the maximum number of connections per transfer for downloads`,
+			Default:  3,
 			Advanced: true,
 		}, {
-			Name: "upload_concurrency",
-			Help: `Set the maximum number of connections per transfer for uploads
-
-The maximum number of allowed connections is 6.`,
+			Name:     "upload_concurrency",
+			Help:     `Set the maximum number of connections per transfer for uploads`,
 			Default:  1,
 			Advanced: true,
 		}, {
@@ -332,7 +319,6 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		opt:       *opt,
 		srv:       &srv,
 		srvListen: listenerObj,
-		pacer:     fs.NewPacer(ctx, pacer.NewDefault(pacer.MinSleep(minSleep), pacer.MaxSleep(maxSleep), pacer.DecayConstant(decayConstant))),
 	}
 	f.features = (&fs.Features{
 		DuplicateFiles:          true,
@@ -390,16 +376,6 @@ func getMegaError(listener *MyMegaListener) mega.MegaError {
 // Just a macro
 func (f *Fs) API() mega.MegaApi {
 	return *f.srv
-}
-
-// shouldRetry returns a boolean as to whether this err deserves to be
-// retried.  It returns the err as a convenience
-func shouldRetry(ctx context.Context, err error) (bool, error) {
-	if fserrors.ContextError(ctx, &err) {
-		return false, err
-	}
-	// Let the mega library handle the low level retries
-	return false, err
 }
 
 // Converts any mega unix time to time.Time
@@ -838,6 +814,19 @@ func NewCustomReadCloser(r io.Reader) *CustomReadCloser {
 	}
 }
 
+// TODO: Bring back CheckLess methods for buffer size limit
+
+// Read overrides the Read method to add additional checks
+func (crc *CustomReadCloser) Read(p []byte) (n int, err error) {
+	n, err = crc.Reader.Read(p)
+
+	if err := crc.listener.CheckOnRead(); err != nil {
+		fs.Errorf("MyMegaTransferListener", "CheckOnRead error: %s", err.Error())
+	}
+
+	return n, err
+}
+
 // Close overrides the Close method to track when it's called
 func (crc *CustomReadCloser) Close() error {
 	crc.closeMu.Lock()
@@ -846,9 +835,6 @@ func (crc *CustomReadCloser) Close() error {
 	if crc.closed {
 		return nil // Avoid double closing
 	}
-
-	// TODO: Causes crashes?
-	//defer mega.DeleteDirectorMegaTransferListener(*b.listener.director)
 
 	if merr := crc.listener.GetError(); merr != nil && (*merr).GetErrorCode() != mega.MegaErrorAPI_OK {
 		fs.Errorf(crc.fs, "Transfer error: %d - %s", (*merr).GetErrorCode(), (*merr).ToString())
@@ -909,9 +895,11 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 
 	// Buffer
 	buf := new(bytes.Buffer)
+	listenerObj.buffer = buf
+	listenerObj.bufferSize = 1024 * 1024 * o.fs.opt.DownloadCache
+	listenerObj.api = *o.fs.srv
 
-	listenerObj.out = buf
-	//reader := io.NopCloser(buf)
+	// TODO: vfs writes is still a little buggy, aint my fault windows opens it 300 god damn times
 	reader := NewCustomReadCloser(buf)
 	reader.listener = listenerObj
 	reader.fs = o.fs
