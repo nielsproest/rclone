@@ -1,6 +1,7 @@
 package meganative
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -821,161 +822,50 @@ func (f *Fs) Rmdir(ctx context.Context, dir string) error {
 
 // ------------------------------------------------------------
 
-// BufferedReaderCloser is a custom type that implements io.ReaderCloser
-type BufferedReaderCloser struct {
-	buffer     []byte
-	bufferSize int
-	bufferMu   sync.Mutex
-	closed     bool
-	paused     bool
-	fs         *Fs
-	listener   *MyMegaTransferListener
+// CustomReadCloser is a custom implementation of io.ReadCloser
+type CustomReadCloser struct {
+	io.Reader
+	closed   bool
+	closeMu  sync.Mutex
+	listener *MyMegaTransferListener
+	fs       *Fs
 }
 
-// NewBufferedReaderCloser creates a new BufferedReaderCloser with a specified buffer size.
-func NewBufferedReaderCloser(bufferSize int) *BufferedReaderCloser {
-	return &BufferedReaderCloser{
-		buffer:     []byte{},
-		bufferSize: bufferSize,
-		closed:     false,
-		paused:     false,
+// NewCustomReadCloser creates a new CustomReadCloser
+func NewCustomReadCloser(r io.Reader) *CustomReadCloser {
+	return &CustomReadCloser{
+		Reader: io.NopCloser(r),
 	}
 }
 
-// Check if the buffer size exceeds double the bufferSize
-func (b *BufferedReaderCloser) CheckExceeds() error {
-	if b.paused || len(b.buffer) < b.bufferSize {
-		return nil
-	}
+// Close overrides the Close method to track when it's called
+func (crc *CustomReadCloser) Close() error {
+	crc.closeMu.Lock()
+	defer crc.closeMu.Unlock()
 
-	_transfer := b.listener.GetTransfer()
-	if _transfer != nil {
-		transfer := *_transfer
-		if transfer.GetState() == mega.MegaTransferSTATE_ACTIVE {
-			if err := b.fs.setPause(transfer, true); err != nil {
-				fs.Debugf(b.fs, "Transfer resume")
-				b.paused = true
-			} else {
-				return fmt.Errorf("transfer resume failed")
-			}
-		}
-	}
-
-	return nil
-}
-
-// Check if the buffer size is less or equal to the buffer size
-func (b *BufferedReaderCloser) CheckLess() error {
-	if !b.paused || len(b.buffer) > b.bufferSize/2 {
-		return nil
-	}
-
-	_transfer := b.listener.GetTransfer()
-	if _transfer != nil {
-		transfer := *_transfer
-		if transfer.GetState() == mega.MegaTransferSTATE_PAUSED {
-			if err := b.fs.setPause(transfer, false); err != nil {
-				fs.Debugf(b.fs, "Transfer pause")
-				b.paused = false
-			} else {
-				return fmt.Errorf("transfer pause failed")
-			}
-		}
-	}
-
-	return nil
-}
-
-// Set the pause state of a transfer
-func (f *Fs) setPause(signal mega.MegaTransfer, paused bool) error {
-	listenerObj, listener := getRequestListener()
-	defer mega.DeleteDirectorMegaRequestListener(listener)
-
-	listenerObj.Reset()
-	f.API().PauseTransfer(signal, paused, listener)
-	listenerObj.Wait()
-
-	if merr := getMegaError(listenerObj); merr != nil && merr.GetErrorCode() != mega.MegaErrorAPI_OK {
-		return fmt.Errorf("SetPause error: %d - %s", merr.GetErrorCode(), merr.ToString())
-	}
-
-	return nil
-}
-
-// Read reads up to len(p) bytes into p.
-func (b *BufferedReaderCloser) Read(p []byte) (n int, err error) {
-	for len(b.buffer) == 0 {
-		if b.closed {
-			return 0, io.EOF
-		}
-
-		time.Sleep(time.Millisecond * 1)
-	}
-
-	b.bufferMu.Lock()
-	defer b.bufferMu.Unlock()
-
-	n = copy(p, b.buffer)
-	b.buffer = b.buffer[n:]
-	if err := b.CheckLess(); err != nil {
-		fs.Errorf(b.fs, "%s", err.Error())
-	}
-
-	return n, nil
-}
-
-// Close closed the file - MAC errors are reported here
-func (b *BufferedReaderCloser) Close() error {
-	b.bufferMu.Lock()
-	defer b.bufferMu.Unlock()
-
-	fs.Debugf(b.fs, "File Close Start")
-
-	// Ask Mega kindly to stop
-	transfer := b.listener.GetTransfer()
-	if transfer != nil {
-		_transfer := *transfer
-		if _transfer.Swigcptr() != 0 {
-			b.fs.API().CancelTransfer(_transfer)
-		}
+	if crc.closed {
+		return nil // Avoid double closing
 	}
 
 	// TODO: Causes crashes?
 	//defer mega.DeleteDirectorMegaTransferListener(*b.listener.director)
 
-	if merr := b.listener.GetError(); merr != nil && (*merr).GetErrorCode() != mega.MegaErrorAPI_OK {
-		fs.Errorf(b.fs, "Transfer error: %d - %s", (*merr).GetErrorCode(), (*merr).ToString())
+	if merr := crc.listener.GetError(); merr != nil && (*merr).GetErrorCode() != mega.MegaErrorAPI_OK {
+		fs.Errorf(crc.fs, "Transfer error: %d - %s", (*merr).GetErrorCode(), (*merr).ToString())
 	}
 
-	fs.Debugf(b.fs, "File Close End")
+	// Ask Mega kindly to stop
+	transfer := crc.listener.GetTransfer()
+	if transfer != nil {
+		_transfer := *transfer
+		if _transfer.Swigcptr() != 0 {
+			crc.fs.API().CancelTransfer(_transfer)
+		}
+	}
 
-	b.closed = true
+	crc.closed = true
+	fmt.Println("Close method called on CustomReadCloser")
 	return nil
-}
-
-// WriteToBuffer writes data to the buffer.
-func (b *BufferedReaderCloser) WriteToBuffer(data []byte) error {
-	b.bufferMu.Lock()
-	defer b.bufferMu.Unlock()
-
-	if b.closed {
-		return io.ErrClosedPipe
-	}
-	b.buffer = append(b.buffer, data...)
-	if err := b.CheckExceeds(); err != nil {
-		fs.Errorf(b.fs, "%s", err.Error())
-	}
-
-	return nil
-}
-
-// Signals an EOF
-func (b *BufferedReaderCloser) EOF() {
-	b.bufferMu.Lock()
-	defer b.bufferMu.Unlock()
-
-	fs.Debugf(b.fs, "File EOF")
-	b.closed = true
 }
 
 // Open an object for read
@@ -996,9 +886,6 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 		}
 	}
 
-	// TODO: Broken when mounted with "--vfs-cache-mode writes" ?
-	// Windows seems to like opening the file MANY times?
-
 	// Fixes
 	if o.Size() <= offset {
 		return nil, io.EOF
@@ -1009,9 +896,6 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 	if 0 >= limit || limit+offset > o.Size() {
 		limit = o.Size() - offset
 	}
-
-	// TODO BUG: vfs cache: stopping download thread as it timed out
-	// If you skip in video even if vfs-cache-mode full
 
 	_node, err := o.getRef()
 	if err != nil {
@@ -1024,10 +908,13 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 	listenerObj, listener := getTransferListener()
 
 	// Buffer
-	reader := NewBufferedReaderCloser(1024 * 1024 * o.fs.opt.DownloadCache)
-	listenerObj.out = reader
-	reader.fs = o.fs
+	buf := new(bytes.Buffer)
+
+	listenerObj.out = buf
+	//reader := io.NopCloser(buf)
+	reader := NewCustomReadCloser(buf)
 	reader.listener = listenerObj
+	reader.fs = o.fs
 
 	listenerObj.Reset()
 	o.fs.API().StartStreaming(node, offset, limit, listener)

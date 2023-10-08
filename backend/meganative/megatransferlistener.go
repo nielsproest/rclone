@@ -1,6 +1,7 @@
 package meganative
 
 import (
+	"bytes"
 	"fmt"
 	mega "rclone/megasdk"
 	"sync"
@@ -10,13 +11,7 @@ import (
 The transfer listener for download and uploads
 */
 
-type BufferWriter interface {
-	WriteToBuffer(data []byte) error
-	EOF()
-}
-
 type MyMegaTransferListener struct {
-	// mega.SwigDirector_MegaTransferListener
 	mega.SwigDirector_MegaTransferListener
 	notified bool
 	err      *mega.MegaError
@@ -24,7 +19,7 @@ type MyMegaTransferListener struct {
 	director *mega.MegaTransferListener
 	m        sync.Mutex
 	cv       *sync.Cond
-	out      BufferWriter
+	out      *bytes.Buffer
 }
 
 func (l *MyMegaTransferListener) OnTransferFinish(api mega.MegaApi, transfer mega.MegaTransfer, e mega.MegaError) {
@@ -43,18 +38,13 @@ func (l *MyMegaTransferListener) OnTransferFinish(api mega.MegaApi, transfer meg
 
 		l.notified = true
 		l.cv.Broadcast()
-
-		if l.out != nil {
-			l.out.EOF()
-		}
 	}
 }
 
 // Only called when "streaming"
 func (l *MyMegaTransferListener) OnTransferData(api mega.MegaApi, transfer mega.MegaTransfer, buffer string) bool {
 	if l.out != nil && len(buffer) > 0 {
-		buf := []byte(buffer)
-		l.out.WriteToBuffer(buf)
+		l.out.WriteString(buffer)
 	}
 
 	if !l.notified {
