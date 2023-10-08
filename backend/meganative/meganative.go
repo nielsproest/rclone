@@ -112,6 +112,7 @@ and uploads and downloads can proceed more quickly on very fast connections.`,
 			Name: "download_cache",
 			Help: `Sets how big the download cache should be in MB
 
+This is a loose limit, as it only check if we go beyond said value.
 The minimum is 1, but this will make your transfers really slow.
 It is recommended to keep it above 32`,
 			Default:  64,
@@ -445,8 +446,13 @@ func getRequestListener() (*MyMegaListener, mega.MegaRequestListener) {
 }
 
 // Create transfer listener (remember to destroy it after)
-func getTransferListener() (*MyMegaTransferListener, mega.MegaTransferListener) {
-	listenerObj := MyMegaTransferListener{}
+func (f *Fs) getTransferListener() (*MyMegaTransferListener, mega.MegaTransferListener) {
+	buf := new(bytes.Buffer)
+	listenerObj := MyMegaTransferListener{
+		buffer:     buf,
+		bufferSize: 1024 * 1024 * f.opt.DownloadCache,
+		api:        *f.srv,
+	}
 	listenerObj.cv = sync.NewCond(&listenerObj.m)
 	listener := mega.NewDirectorMegaTransferListener(&listenerObj)
 	listenerObj.director = &listener
@@ -814,8 +820,6 @@ func NewCustomReadCloser(r io.Reader) *CustomReadCloser {
 	}
 }
 
-// TODO: Bring back CheckLess methods for buffer size limit
-
 // Read overrides the Read method to add additional checks
 func (crc *CustomReadCloser) Read(p []byte) (n int, err error) {
 	n, err = crc.Reader.Read(p)
@@ -836,6 +840,7 @@ func (crc *CustomReadCloser) Close() error {
 		return nil // Avoid double closing
 	}
 
+	// Check for any errors
 	if merr := crc.listener.GetError(); merr != nil && (*merr).GetErrorCode() != mega.MegaErrorAPI_OK {
 		fs.Errorf(crc.fs, "Transfer error: %d - %s", (*merr).GetErrorCode(), (*merr).ToString())
 	}
@@ -856,7 +861,8 @@ func (crc *CustomReadCloser) Close() error {
 
 // Open an object for read
 func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadCloser, error) {
-	fs.Debugf(o.fs, "File Open %s", o.Remote())
+	f := o.fs
+	fs.Debugf(o, "File Open %s", o.Remote())
 
 	var offset, limit int64 = 0, -1
 	for _, option := range options {
@@ -888,24 +894,17 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 		return nil, err
 	}
 	node := (*_node).Copy()
-	fmt.Printf("NAME %s\n", node.GetName())
 
 	// Create listener
-	listenerObj, listener := getTransferListener()
-
-	// Buffer
-	buf := new(bytes.Buffer)
-	listenerObj.buffer = buf
-	listenerObj.bufferSize = 1024 * 1024 * o.fs.opt.DownloadCache
-	listenerObj.api = *o.fs.srv
+	listenerObj, listener := f.getTransferListener()
 
 	// TODO: vfs writes is still a little buggy, aint my fault windows opens it 300 god damn times
-	reader := NewCustomReadCloser(buf)
+	reader := NewCustomReadCloser(listenerObj.buffer)
 	reader.listener = listenerObj
-	reader.fs = o.fs
+	reader.fs = f
 
 	listenerObj.Reset()
-	o.fs.API().StartStreaming(node, offset, limit, listener)
+	f.API().StartStreaming(node, offset, limit, listener)
 	listenerObj.Wait()
 
 	if merr := listenerObj.GetError(); merr != nil && (*merr).GetErrorCode() != mega.MegaErrorAPI_OK {
@@ -1311,7 +1310,7 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	}
 
 	// Create listener
-	listenerObj, listener := getTransferListener()
+	listenerObj, listener := f.getTransferListener()
 	defer mega.DeleteDirectorMegaTransferListener(listener)
 
 	// Create cancel token
