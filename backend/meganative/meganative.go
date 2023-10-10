@@ -19,8 +19,10 @@ import (
 	"github.com/rclone/rclone/fs/config/configmap"
 	"github.com/rclone/rclone/fs/config/configstruct"
 	"github.com/rclone/rclone/fs/config/obscure"
+	"github.com/rclone/rclone/fs/fserrors"
 	"github.com/rclone/rclone/fs/hash"
 	"github.com/rclone/rclone/lib/encoder"
+	"github.com/rclone/rclone/lib/pacer"
 	"github.com/rclone/rclone/lib/readers"
 )
 
@@ -33,7 +35,15 @@ import (
  *
  * But most importantly at the end:
  * Find a way to ship this thing
+ * Maybe just make a docker image
  */
+
+const (
+	minSleep      = 10 * time.Millisecond
+	maxSleep      = 2 * time.Second
+	eventWaitTime = 500 * time.Millisecond
+	decayConstant = 2 // bigger for slower decay, exponential
+)
 
 // Register with Fs
 func init() {
@@ -120,12 +130,25 @@ It is recommended to keep it above 32`,
 		}, {
 			Name:     "download_concurrency",
 			Help:     `Set the maximum number of connections per transfer for downloads`,
-			Default:  3,
+			Default:  1,
 			Advanced: true,
 		}, {
 			Name:     "upload_concurrency",
 			Help:     `Set the maximum number of connections per transfer for uploads`,
 			Default:  1,
+			Advanced: true,
+		}, {
+			Name: "download_min_rate",
+			Help: `Set the miniumum acceptable streaming speed for streaming transfers
+
+When streaming a file with startStreaming(), the SDK monitors the transfer rate.
+After a few seconds grace period, the monitoring starts. If the average rate is below
+the minimum rate specified (determined by this function, or by default a reasonable rate
+for audio/video, then the streaming operation will fail with MegaError::API_EAGAIN.
+
+Use -1 to use the default built into the library.
+Use 0 to prevent the check.`,
+			Default:  -1,
 			Advanced: true,
 		}, {
 			Name:     config.ConfigEncoding,
@@ -161,6 +184,7 @@ type Options struct {
 	DownloadCache   int                  `config:"download_cache"`
 	DownloadThreads int                  `config:"download_concurrency"`
 	UploadThreads   int                  `config:"upload_concurrency"`
+	DownloadMinRate int                  `config:"download_min_rate"`
 	Enc             encoder.MultiEncoder `config:"encoding"`
 }
 
@@ -170,10 +194,10 @@ type Fs struct {
 	root      string // the path we are working on
 	_rootNode *mega.MegaNode
 	opt       Options         // parsed config options
+	pacer     *fs.Pacer       // pacer for API calls
 	features  *fs.Features    // optional features
 	srv       *mega.MegaApi   // the connection to the server
 	srvListen *MyMegaListener // the request listener
-	pacer     *fs.Pacer       // pacer for API calls
 }
 
 // Object describes a mega object
@@ -186,8 +210,7 @@ type Fs struct {
 type Object struct {
 	fs     *Fs    // what this object is part of
 	remote string // The remote path
-	handle int64
-	// info   *mega.MegaNode // pointer to the mega node
+	handle int64  // The node identifier
 }
 
 // Name of the remote (as passed into NewFs)
@@ -239,10 +262,6 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	logger := mega.NewDirectorMegaLogger(&loggerObj)
 	mega.MegaApiAddLoggerObject(logger)*/
 
-	// Dont use multithreaded streams, MEGA-SDK is already multi-threaded
-	ci := fs.GetConfig(ctx)
-	ci.MultiThreadStreams = 0
-
 	// Used for api calls, not transfers
 	listenerObj, listener := getRequestListener()
 
@@ -252,30 +271,31 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	if os.IsNotExist(err) {
 		err := os.MkdirAll(opt.Cache, 0755) // 0755 sets the directory permissions
 		if err != nil {
-			return nil, fmt.Errorf("error creating directory: %s", err.Error())
+			return nil, fmt.Errorf("error creating directory: %w", err)
 		}
 		fs.Debugf("mega-native", "Directory created: %s", opt.Cache)
 	} else if err != nil {
-		return nil, fmt.Errorf("error checking directory: %s", err.Error())
+		return nil, fmt.Errorf("error checking directory: %w", err)
 	} else {
 		fs.Debugf("mega-native", "Directory already exists: %s", opt.Cache)
 	}
 
 	// TODO: Generate code at: https://mega.co.nz/#sdk
 	srv := mega.NewMegaApi(
-		"ht1gUZLZ",                   // appKey
-		opt.Cache,                    // basePath
-		"MEGA/SDK Rclone filesystem", // userAgent
-		uint(opt.WorkerThreads))      // workerThreadCount
+		"ht1gUZLZ", // appKey
+		opt.Cache,  // basePath
+		fmt.Sprintf("MEGA/SDK Rclone FS %s", fs.Version), // userAgent
+		uint(opt.WorkerThreads))                          // workerThreadCount
 	srv.AddRequestListener(listener)
+	srv.SetStreamingMinimumRate(opt.DownloadMinRate)
 
 	// Use HTTPS
 	listenerObj.Reset()
 	srv.UseHttpsOnly(opt.UseHTTPS, listener)
 	listenerObj.Wait()
 
-	if merr := getMegaError(listenerObj); merr != nil && merr.GetErrorCode() != mega.MegaErrorAPI_OK {
-		fs.Errorf("mega-native", "Couldn't set UseHttpsOnly %d - %s", merr.GetErrorCode(), merr.ToString())
+	if _, err := GetMegaError(listenerObj, "UseHttpsOnly"); err != nil {
+		fs.Errorf("mega-native", "%w", err)
 	}
 
 	// DL Threads
@@ -283,8 +303,8 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	srv.SetMaxConnections(mega.MegaTransferTYPE_DOWNLOAD, opt.DownloadThreads, listener)
 	listenerObj.Wait()
 
-	if merr := getMegaError(listenerObj); merr != nil && merr.GetErrorCode() != mega.MegaErrorAPI_OK {
-		fs.Errorf("mega-native", "Couldn't set download threads %d - %s", merr.GetErrorCode(), merr.ToString())
+	if _, err := GetMegaError(listenerObj, "SetMaxConnections Downloads"); err != nil {
+		fs.Errorf("mega-native", "%w", err)
 	}
 
 	// UP Threads
@@ -292,8 +312,8 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	srv.SetMaxConnections(mega.MegaTransferTYPE_UPLOAD, opt.UploadThreads, listener)
 	listenerObj.Wait()
 
-	if merr := getMegaError(listenerObj); merr != nil && merr.GetErrorCode() != mega.MegaErrorAPI_OK {
-		fs.Errorf("mega-native", "Couldn't set upload threads %d - %s", merr.GetErrorCode(), merr.ToString())
+	if _, err := GetMegaError(listenerObj, "SetMaxConnections Uploads"); err != nil {
+		fs.Errorf("mega-native", "%w", err)
 	}
 
 	// TODO: Use debug for something
@@ -304,8 +324,8 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	srv.Login(opt.User, opt.Pass)
 	listenerObj.Wait()
 
-	if merr := getMegaError(listenerObj); merr != nil && merr.GetErrorCode() != mega.MegaErrorAPI_OK {
-		return nil, fmt.Errorf("couldn't login: %d - %s", merr.GetErrorCode(), merr.ToString())
+	if _, err := GetMegaError(listenerObj, "Login"); err != nil {
+		return nil, err
 	}
 
 	fs.Logf("mega-native", "Waiting for nodes...")
@@ -320,10 +340,12 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		opt:       *opt,
 		srv:       &srv,
 		srvListen: listenerObj,
+		pacer:     fs.NewPacer(ctx, pacer.NewDefault(pacer.MinSleep(minSleep), pacer.MaxSleep(maxSleep), pacer.DecayConstant(decayConstant))),
 	}
 	f.features = (&fs.Features{
 		DuplicateFiles:          true,
 		CanHaveEmptyDirectories: true,
+		NoMultiThreading:        true,
 	}).Fill(ctx, f)
 
 	// Find the root node and check if it is a file or not
@@ -365,18 +387,36 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 // Support functions
 
 // Just a macro
-func getMegaError(listener *MyMegaListener) mega.MegaError {
-	megaerr := listener.GetError()
-	if megaerr == nil {
-		return nil
-	}
-
-	return *megaerr
-}
-
-// Just a macro
 func (f *Fs) API() mega.MegaApi {
 	return *f.srv
+}
+
+type HasMegaError interface {
+	GetError() *mega.MegaError
+}
+
+func GetMegaError(listener HasMegaError, operation string) (mega.MegaError, error) {
+	_merr := listener.GetError()
+	if _merr == nil {
+		return nil, nil
+	}
+	merr := *_merr
+
+	if merr.GetErrorCode() != mega.MegaErrorAPI_OK {
+		return merr, fmt.Errorf("MEGA %s Error: %d - %s", operation, merr.GetErrorCode(), merr.ToString())
+	}
+
+	return merr, nil
+}
+
+// shouldRetry returns a boolean as to whether this err deserves to be
+// retried.  It returns the err as a convenience
+func shouldRetry(ctx context.Context, err error) (bool, error) {
+	if fserrors.ContextError(ctx, &err) {
+		return false, err
+	}
+	// Let the mega library handle the low level retries
+	return false, err
 }
 
 // Converts any mega unix time to time.Time
@@ -455,34 +495,39 @@ func (f *Fs) getTransferListener() (*MyMegaTransferListener, mega.MegaTransferLi
 	}
 	listenerObj.cv = sync.NewCond(&listenerObj.m)
 	listener := mega.NewDirectorMegaTransferListener(&listenerObj)
-	listenerObj.director = &listener
 	return &listenerObj, listener
 }
 
 // Permanently deletes a node
-func (f *Fs) hardDelete(node mega.MegaNode) error {
+func (f *Fs) hardDelete(ctx context.Context, node mega.MegaNode) error {
 	fs.Debugf(f, "hardDelete %s", node.GetName())
 
 	listenerObj, listener := getRequestListener()
 	defer mega.DeleteDirectorMegaRequestListener(listener)
 
-	listenerObj.Reset()
-	f.API().Remove(node, listener)
-	listenerObj.Wait()
+	// Hard deletes a node
+	err := f.pacer.Call(func() (bool, error) {
+		listenerObj.Reset()
+		f.API().Remove(node, listener)
+		listenerObj.Wait()
 
-	if merr := getMegaError(listenerObj); merr != nil && merr.GetErrorCode() != mega.MegaErrorAPI_OK {
-		return fmt.Errorf("delete error: %d - %s", merr.GetErrorCode(), merr.ToString())
+		_, err := GetMegaError(listenerObj, "NodeRemove")
+		return shouldRetry(ctx, err)
+	})
+
+	if err != nil {
+		return fmt.Errorf("remove node failed: %w", err)
 	}
 
 	return nil
 }
 
 // Deletes a node
-func (f *Fs) delete(node mega.MegaNode) error {
+func (f *Fs) delete(ctx context.Context, node mega.MegaNode) error {
 	fs.Debugf(f, "delete %s", node.GetName())
 
 	if f.opt.HardDelete {
-		if err := f.hardDelete(node); err != nil {
+		if err := f.hardDelete(ctx, node); err != nil {
 			return err
 		}
 	} else {
@@ -491,7 +536,7 @@ func (f *Fs) delete(node mega.MegaNode) error {
 			return fmt.Errorf("trash node was null")
 		}
 
-		if err := f.moveNode(node, trashNode); err != nil {
+		if err := f.moveNode(ctx, node, trashNode); err != nil {
 			return err
 		}
 	}
@@ -500,43 +545,55 @@ func (f *Fs) delete(node mega.MegaNode) error {
 }
 
 // Moves a node into a directory node
-func (f *Fs) moveNode(node mega.MegaNode, dir mega.MegaNode) error {
+func (f *Fs) moveNode(ctx context.Context, node mega.MegaNode, dir mega.MegaNode) error {
 	fs.Debugf(f, "moveNode %s -> %s/", node.GetName(), dir.GetName())
 
 	listenerObj, listener := getRequestListener()
 	defer mega.DeleteDirectorMegaRequestListener(listener)
 
-	listenerObj.Reset()
-	f.API().MoveNode(node, dir, listener)
-	listenerObj.Wait()
+	// Moves a node into another node
+	err := f.pacer.Call(func() (bool, error) {
+		listenerObj.Reset()
+		f.API().MoveNode(node, dir, listener)
+		listenerObj.Wait()
 
-	if merr := getMegaError(listenerObj); merr != nil && merr.GetErrorCode() != mega.MegaErrorAPI_OK {
-		return fmt.Errorf("move error: %d - %s", merr.GetErrorCode(), merr.ToString())
+		_, err := GetMegaError(listenerObj, "MoveNode")
+		return shouldRetry(ctx, err)
+	})
+
+	if err != nil {
+		return fmt.Errorf("move node failed: %w", err)
 	}
 
 	return nil
 }
 
 // Rename a node
-func (f *Fs) renameNode(node mega.MegaNode, name string) error {
+func (f *Fs) renameNode(ctx context.Context, node mega.MegaNode, name string) error {
 	fs.Debugf(f, "rename %s -> %s", node.GetName(), name)
 
 	listenerObj, listener := getRequestListener()
 	defer mega.DeleteDirectorMegaRequestListener(listener)
 
-	listenerObj.Reset()
-	f.API().RenameNode(node, name, listener)
-	listenerObj.Wait()
+	// Rename node
+	err := f.pacer.Call(func() (bool, error) {
+		listenerObj.Reset()
+		f.API().RenameNode(node, name, listener)
+		listenerObj.Wait()
 
-	if merr := getMegaError(listenerObj); merr != nil && merr.GetErrorCode() != mega.MegaErrorAPI_OK {
-		return fmt.Errorf("rename error: %d - %s", merr.GetErrorCode(), merr.ToString())
+		_, err := GetMegaError(listenerObj, "RenameNode")
+		return shouldRetry(ctx, err)
+	})
+
+	if err != nil {
+		return fmt.Errorf("rename node failed: %w", err)
 	}
 
 	return nil
 }
 
 // Creates a root if missing
-func (f *Fs) rootFix() error {
+func (f *Fs) rootFix(ctx context.Context) error {
 	if f._rootNode == nil {
 		root, rootName := filepath.Split(f.root)
 		rootNode := f.API().GetNodeByPath(root)
@@ -548,12 +605,12 @@ func (f *Fs) rootFix() error {
 		defer mega.DeleteDirectorMegaRequestListener(listener)
 
 		// Create folder
-		listenerObj.Reset()
+		// TODO: Pacer
 		f.API().CreateFolder(rootName, rootNode, listener)
 		listenerObj.Wait()
 
-		if merr := getMegaError(listenerObj); merr != nil && merr.GetErrorCode() != mega.MegaErrorAPI_OK {
-			return fmt.Errorf("MEGA Mkdir root Error: %d - %s", merr.GetErrorCode(), merr.ToString())
+		if _, err := GetMegaError(listenerObj, "CreateFolder"); err != nil {
+			return err
 		}
 
 		rootNode = f.API().GetNodeByPath(f.root)
@@ -567,10 +624,10 @@ func (f *Fs) rootFix() error {
 }
 
 // Make the parent directory of a path and return it
-func (f *Fs) mkdirParent(path string) (*mega.MegaNode, error) {
+func (f *Fs) mkdirParent(ctx context.Context, path string) (*mega.MegaNode, error) {
 	fs.Debugf(f, "mkdirParent %s", path)
 
-	err := f.rootFix()
+	err := f.rootFix(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -596,7 +653,7 @@ func (f *Fs) mkdirParent(path string) (*mega.MegaNode, error) {
 		return nil, fs.ErrorDirNotFound
 	}
 
-	return f.mkdir(_rootName, &_rootParentNode)
+	return f.mkdir(ctx, _rootName, &_rootParentNode)
 }
 
 // Iterate over the children of a node
@@ -611,7 +668,9 @@ func (f *Fs) iterChildren(node mega.MegaNode) (<-chan mega.MegaNode, error) {
 	go func() {
 		defer close(dataCh)
 		for i := 0; i < children.Size(); i++ {
-			dataCh <- children.Get(i)
+			// Children are destroyed if the parent is free'd
+			// Ensure this doesnt happen by making a copy
+			dataCh <- children.Get(i).Copy()
 		}
 	}()
 
@@ -619,10 +678,10 @@ func (f *Fs) iterChildren(node mega.MegaNode) (<-chan mega.MegaNode, error) {
 }
 
 // Make directory and return it
-func (f *Fs) mkdir(name string, parent *mega.MegaNode) (*mega.MegaNode, error) {
+func (f *Fs) mkdir(ctx context.Context, name string, parent *mega.MegaNode) (*mega.MegaNode, error) {
 	fs.Debugf(f, "mkdir %s/%s", (*parent).GetName(), name)
 
-	err := f.rootFix()
+	err := f.rootFix(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -631,12 +690,17 @@ func (f *Fs) mkdir(name string, parent *mega.MegaNode) (*mega.MegaNode, error) {
 	defer mega.DeleteDirectorMegaRequestListener(listener)
 
 	// Create folder
-	listenerObj.Reset()
-	f.API().CreateFolder(name, *parent, listener)
-	listenerObj.Wait()
+	err = f.pacer.Call(func() (bool, error) {
+		listenerObj.Reset()
+		f.API().CreateFolder(name, *parent, listener)
+		listenerObj.Wait()
 
-	if merr := getMegaError(listenerObj); merr != nil && merr.GetErrorCode() != mega.MegaErrorAPI_OK {
-		return nil, fmt.Errorf("MEGA Mkdir Error: %d - %s", merr.GetErrorCode(), merr.ToString())
+		_, err := GetMegaError(listenerObj, "CreateFolder")
+		return shouldRetry(ctx, err)
+	})
+
+	if err != nil {
+		return nil, fmt.Errorf("create folder node failed: %w", err)
 	}
 
 	// Find resulting folder
@@ -662,7 +726,7 @@ func (f *Fs) mkdir(name string, parent *mega.MegaNode) (*mega.MegaNode, error) {
 // If the user fn ever returns true then it early exits with found = true
 func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err error) {
 	fs.Debugf(f, "List %s", dir)
-	f.rootFix()
+	f.rootFix(ctx)
 
 	dirNode, err := f.findDir(dir)
 	if err != nil {
@@ -712,7 +776,7 @@ func (f *Fs) Mkdir(ctx context.Context, dir string) error {
 		return fs.ErrorIsFile
 	}
 
-	_, err = f.mkdir(srcName, n)
+	_, err = f.mkdir(ctx, srcName, n)
 	return err
 }
 
@@ -721,14 +785,14 @@ func (f *Fs) Mkdir(ctx context.Context, dir string) error {
 // If it can't be found it returns the error fs.ErrorObjectNotFound.
 func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 	fs.Debugf(f, "NewObject %s", remote)
-	f.rootFix()
+	f.rootFix(ctx)
 
 	o := &Object{
 		fs:     f,
 		remote: remote,
 	}
 
-	_, err := f.mkdirParent(remote)
+	_, err := f.mkdirParent(ctx, remote)
 	if err != nil && err != fs.ErrorDirExists {
 		return o, err
 	}
@@ -794,7 +858,7 @@ func (f *Fs) Rmdir(ctx context.Context, dir string) error {
 		return fmt.Errorf("folder not empty")
 	}*/
 
-	if err := f.delete(*n); err != nil {
+	if err := f.delete(ctx, *n); err != nil {
 		return err
 	}
 
@@ -822,10 +886,22 @@ func NewCustomReadCloser(r io.Reader) *CustomReadCloser {
 
 // Read overrides the Read method to add additional checks
 func (crc *CustomReadCloser) Read(p []byte) (n int, err error) {
+	// If the reader ended with an error
+	/*if crc.listener.done && crc.listener.err != nil {
+		if merr, err := GetMegaError(crc.listener, "Download"); err != nil {
+			if merr.GetErrorCode() ==  && !crc.closed {
+				crc.Close()
+			}
+			// return 0, err
+		}
+	}*/
+
+	// Read from NopCloser
 	n, err = crc.Reader.Read(p)
 
+	// Un-throttle if appropriate
 	if err := crc.listener.CheckOnRead(); err != nil {
-		fs.Errorf("MyMegaTransferListener", "CheckOnRead error: %s", err.Error())
+		fs.Errorf("MyMegaTransferListener", "CheckOnRead error: %w", err)
 	}
 
 	return n, err
@@ -837,12 +913,12 @@ func (crc *CustomReadCloser) Close() error {
 	defer crc.closeMu.Unlock()
 
 	if crc.closed {
-		return nil // Avoid double closing
+		return fmt.Errorf("already closed") // Avoid double closing
 	}
 
 	// Check for any errors
-	if merr := crc.listener.GetError(); merr != nil && (*merr).GetErrorCode() != mega.MegaErrorAPI_OK {
-		fs.Errorf(crc.fs, "Transfer error: %d - %s", (*merr).GetErrorCode(), (*merr).ToString())
+	if _, err := GetMegaError(crc.listener, "Download"); err != nil {
+		fs.Errorf(crc.fs, "%w", err)
 	}
 
 	// Ask Mega kindly to stop
@@ -854,6 +930,7 @@ func (crc *CustomReadCloser) Close() error {
 		}
 	}
 
+	// Close
 	crc.closed = true
 	fmt.Println("Close method called on CustomReadCloser")
 	return nil
@@ -889,12 +966,6 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 		limit = o.Size() - offset
 	}
 
-	_node, err := o.getRef()
-	if err != nil {
-		return nil, err
-	}
-	node := (*_node).Copy()
-
 	// Create listener
 	listenerObj, listener := f.getTransferListener()
 
@@ -903,12 +974,23 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 	reader.listener = listenerObj
 	reader.fs = f
 
-	listenerObj.Reset()
-	f.API().StartStreaming(node, offset, limit, listener)
-	listenerObj.Wait()
+	// Start streamer and wait for first response
+	err := f.pacer.Call(func() (bool, error) {
+		// Get node referencce
+		_node, err := o.getRef()
+		if err != nil {
+			return shouldRetry(ctx, err)
+		}
 
-	if merr := listenerObj.GetError(); merr != nil && (*merr).GetErrorCode() != mega.MegaErrorAPI_OK {
-		return nil, fmt.Errorf("transfer error: %d - %s", (*merr).GetErrorCode(), (*merr).ToString())
+		listenerObj.Reset()
+		f.API().StartStreaming(*_node, offset, limit, listener)
+		listenerObj.WaitStream()
+
+		_, err = GetMegaError(listenerObj, "StartStreaming")
+		return shouldRetry(ctx, err)
+	})
+	if err != nil {
+		return nil, fmt.Errorf("open download file failed: %w", err)
 	}
 
 	return readers.NewLimitedReadCloser(reader, limit), nil
@@ -929,7 +1011,7 @@ func (o *Object) Remove(ctx context.Context) error {
 		return fs.ErrorIsDir
 	}
 
-	if err := o.fs.delete(*n); err != nil {
+	if err := o.fs.delete(ctx, *n); err != nil {
 		return err
 	}
 
@@ -969,7 +1051,7 @@ func (f *Fs) Purge(ctx context.Context, dir string) error {
 		return fmt.Errorf("folder not empty")
 	}*/
 
-	if err := f.delete(*n); err != nil {
+	if err := f.delete(ctx, *n); err != nil {
 		return err
 	}
 
@@ -1007,7 +1089,7 @@ func (dstFs *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Obj
 		return nil, fs.ErrorIsFile
 	}
 
-	destNode, err := dstFs.mkdirParent(remote)
+	destNode, err := dstFs.mkdirParent(ctx, remote)
 	if err != nil && err != fs.ErrorDirExists {
 		fs.Debugf(dstFs, "Destination folder not found")
 		return nil, err
@@ -1022,12 +1104,12 @@ func (dstFs *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Obj
 	dstPath, dstName := filepath.Split(absDst)
 
 	if srcPath != dstPath {
-		if err := dstFs.moveNode(*srcNode, *destNode); err != nil {
+		if err := dstFs.moveNode(ctx, *srcNode, *destNode); err != nil {
 			return nil, err
 		}
 	}
 	if srcName != dstName {
-		if err := dstFs.renameNode(*srcNode, dstName); err != nil {
+		if err := dstFs.renameNode(ctx, *srcNode, dstName); err != nil {
 			return nil, err
 		}
 	}
@@ -1057,7 +1139,7 @@ func (dstFs *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote st
 		return err
 	}
 
-	dstNode, err := dstFs.mkdirParent(dstRemote)
+	dstNode, err := dstFs.mkdirParent(ctx, dstRemote)
 	if err != nil && err != fs.ErrorDirExists {
 		return err
 	}
@@ -1071,12 +1153,12 @@ func (dstFs *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote st
 	destPath, destName := filepath.Split(absDst)
 
 	if srcPath != destPath {
-		if err := dstFs.moveNode(*srcNode, *dstNode); err != nil {
+		if err := dstFs.moveNode(ctx, *srcNode, *dstNode); err != nil {
 			return err
 		}
 	}
 	if srcName != destName {
-		if err := dstFs.renameNode(*srcNode, destName); err != nil {
+		if err := dstFs.renameNode(ctx, *srcNode, destName); err != nil {
 			return err
 		}
 	}
@@ -1114,12 +1196,12 @@ func (f *Fs) MergeDirs(ctx context.Context, dirs []fs.Directory) error {
 		}
 
 		for node := range children {
-			if err := f.moveNode(node, dstNode); err != nil {
+			if err := f.moveNode(ctx, node, dstNode); err != nil {
 				return err
 			}
 		}
 
-		if err := f.delete(srcNode); err != nil {
+		if err := f.delete(ctx, srcNode); err != nil {
 			return err
 		}
 	}
@@ -1138,9 +1220,19 @@ func (f *Fs) About(ctx context.Context) (*fs.Usage, error) {
 		listenerObj, listener := getRequestListener()
 		defer mega.DeleteDirectorMegaRequestListener(listener)
 
-		listenerObj.Reset()
-		f.API().GetAccountDetails(listener)
-		listenerObj.Wait()
+		// Get account details
+		err := f.pacer.Call(func() (bool, error) {
+			listenerObj.Reset()
+			f.API().GetAccountDetails(listener)
+			listenerObj.Wait()
+
+			_, err := GetMegaError(listenerObj, "GetAccountDetails")
+			return shouldRetry(ctx, err)
+		})
+
+		if err != nil {
+			return nil, fmt.Errorf("GetAccountDetails failed: %w", err)
+		}
 
 		_data := listenerObj.GetRequest()
 		if _data == nil {
@@ -1287,7 +1379,7 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	f := o.fs
 	fs.Debugf(f, "Update %s", o.Remote())
 
-	_parentNode, err := f.mkdirParent(o.remote)
+	_parentNode, err := f.mkdirParent(ctx, o.remote)
 	if err != nil && err != fs.ErrorDirExists {
 		fs.Debugf(f, "Parent folder creation failed")
 		return err
@@ -1319,26 +1411,27 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 
 	// Upload
 	_, fileName := filepath.Split(o.remote)
-	listenerObj.Reset()
-	f.API().StartUpload(
-		tempFile.Name(),         //Localpath
-		parentNode,              //Directory
-		fileName,                //Filename
-		src.ModTime(ctx).Unix(), //Modification time
-		f.opt.Cache,             // Temporary directory
-		false,                   // Temporary source
-		false,                   // Priority
-		token,                   // Cancel token
-		listener,                //Listener
-	)
+	err = f.pacer.Call(func() (bool, error) {
+		listenerObj.Reset()
+		f.API().StartUpload(
+			tempFile.Name(),         //Localpath
+			parentNode,              //Directory
+			fileName,                //Filename
+			src.ModTime(ctx).Unix(), //Modification time
+			f.opt.Cache,             // Temporary directory
+			false,                   // Temporary source
+			false,                   // Priority
+			token,                   // Cancel token
+			listener,                //Listener
+		)
+		listenerObj.Wait()
 
-	// Wait
-	listenerObj.Wait()
+		_, err := GetMegaError(listenerObj, "StartUpload")
+		return shouldRetry(ctx, err)
+	})
 
-	// If error
-	merr := listenerObj.GetError()
-	if merr != nil && (*merr).GetErrorCode() != mega.MegaErrorAPI_OK {
-		return fmt.Errorf("couldn't upload: %d - %s", (*merr).GetErrorCode(), (*merr).ToString())
+	if err != nil {
+		return fmt.Errorf("StartUpload failed: %w", err)
 	}
 
 	// Set metadata

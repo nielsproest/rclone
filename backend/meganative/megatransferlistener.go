@@ -15,16 +15,18 @@ The transfer listener for download and uploads
 
 type MyMegaTransferListener struct {
 	mega.SwigDirector_MegaTransferListener
+	notified bool
+	err      *mega.MegaError
+	transfer *mega.MegaTransfer
+	m        sync.Mutex
+	cv       *sync.Cond
+	// Download specific
 	api        mega.MegaApi
-	notified   bool
-	err        *mega.MegaError
-	transfer   *mega.MegaTransfer
-	director   *mega.MegaTransferListener
-	m          sync.Mutex
-	cv         *sync.Cond
 	buffer     *bytes.Buffer
 	bufferSize int
+	ready      bool
 	paused     bool
+	done       bool
 }
 
 func (l *MyMegaTransferListener) OnTransferFinish(api mega.MegaApi, transfer mega.MegaTransfer, e mega.MegaError) {
@@ -43,6 +45,9 @@ func (l *MyMegaTransferListener) OnTransferFinish(api mega.MegaApi, transfer meg
 
 		l.notified = true
 		l.cv.Broadcast()
+
+		l.done = true
+		l.ready = true
 	}
 }
 
@@ -56,20 +61,11 @@ func (l *MyMegaTransferListener) OnTransferData(api mega.MegaApi, transfer mega.
 		}
 	}
 
-	if !l.notified {
-		req := transfer.Copy()
-		l.transfer = &req
-
-		tr := transfer.GetLastError()
-		if tr.Swigcptr() != 0 {
-			err := tr.Copy()
-			l.err = &err
-		}
-
+	{
 		l.m.Lock()
 		defer l.m.Unlock()
 
-		l.notified = true
+		l.ready = true
 		l.cv.Broadcast()
 	}
 
@@ -97,10 +93,21 @@ func (l *MyMegaTransferListener) Wait() {
 	}
 }
 
+func (l *MyMegaTransferListener) WaitStream() {
+	// Wait until notified becomes true
+	l.m.Lock()
+	defer l.m.Unlock()
+
+	for !l.ready {
+		l.cv.Wait()
+	}
+}
+
 func (l *MyMegaTransferListener) Reset() {
 	l.err = nil
 	l.transfer = nil
 	l.notified = false
+	l.ready = false
 }
 
 // Set the pause state of a transfer
@@ -118,8 +125,8 @@ func (l *MyMegaTransferListener) setPause(paused bool) error {
 	l.api.PauseTransfer(transfer, paused, listener)
 	listenerObj.Wait()
 
-	if merr := getMegaError(listenerObj); merr != nil && merr.GetErrorCode() != mega.MegaErrorAPI_OK {
-		return fmt.Errorf("SetPause error: %d - %s", merr.GetErrorCode(), merr.ToString())
+	if merr := listenerObj.GetError(); merr != nil && (*merr).GetErrorCode() != mega.MegaErrorAPI_OK {
+		return fmt.Errorf("SetPause error: %d - %s", (*merr).GetErrorCode(), (*merr).ToString())
 	}
 
 	return nil
