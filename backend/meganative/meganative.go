@@ -139,7 +139,7 @@ It is recommended to keep it above 32`,
 			Advanced: true,
 		}, {
 			Name: "download_min_rate",
-			Help: `Set the miniumum acceptable streaming speed for streaming transfers
+			Help: `Set the minimum acceptable streaming speed for streaming transfers
 
 When streaming a file with startStreaming(), the SDK monitors the transfer rate.
 After a few seconds grace period, the monitoring starts. If the average rate is below
@@ -875,6 +875,7 @@ type CustomReadCloser struct {
 	closeMu  sync.Mutex
 	listener *MyMegaTransferListener
 	fs       *Fs
+	endErr   mega.MegaError
 }
 
 // NewCustomReadCloser creates a new CustomReadCloser
@@ -887,14 +888,14 @@ func NewCustomReadCloser(r io.Reader) *CustomReadCloser {
 // Read overrides the Read method to add additional checks
 func (crc *CustomReadCloser) Read(p []byte) (n int, err error) {
 	// If the reader ended with an error
-	/*if crc.listener.done && crc.listener.err != nil {
-		if merr, err := GetMegaError(crc.listener, "Download"); err != nil {
-			if merr.GetErrorCode() ==  && !crc.closed {
+	if crc.listener.done && crc.endErr != nil {
+		if crc.endErr.GetErrorCode() != mega.MegaErrorAPI_OK {
+			if !crc.closed {
 				crc.Close()
 			}
 			// return 0, err
 		}
-	}*/
+	}
 
 	// Read from NopCloser
 	n, err = crc.Reader.Read(p)
@@ -917,16 +918,20 @@ func (crc *CustomReadCloser) Close() error {
 	}
 
 	// Check for any errors
-	if _, err := GetMegaError(crc.listener, "Download"); err != nil {
+	if merr, err := GetMegaError(crc.listener, "Download"); err != nil {
 		fs.Errorf(crc.fs, "%w", err)
+		crc.endErr = merr
 	}
 
-	// Ask Mega kindly to stop
-	transfer := crc.listener.GetTransfer()
-	if transfer != nil {
-		_transfer := *transfer
-		if _transfer.Swigcptr() != 0 {
-			crc.fs.API().CancelTransfer(_transfer)
+	if !crc.listener.done {
+		// Ask Mega kindly to stop
+		transfer := crc.listener.GetTransfer()
+		if transfer != nil {
+			_transfer := *transfer
+			if _transfer.Swigcptr() != 0 {
+				// TODO: Wait for this
+				crc.fs.API().CancelTransfer(_transfer)
+			}
 		}
 	}
 
@@ -977,13 +982,13 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 	// Start streamer and wait for first response
 	err := f.pacer.Call(func() (bool, error) {
 		// Get node referencce
-		_node, err := o.getRef()
+		node, err := o.getRef()
 		if err != nil {
 			return shouldRetry(ctx, err)
 		}
 
 		listenerObj.Reset()
-		f.API().StartStreaming(*_node, offset, limit, listener)
+		f.API().StartStreaming(*node, offset, limit, listener)
 		listenerObj.WaitStream()
 
 		_, err = GetMegaError(listenerObj, "StartStreaming")

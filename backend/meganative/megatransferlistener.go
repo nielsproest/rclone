@@ -56,6 +56,7 @@ func (l *MyMegaTransferListener) OnTransferData(api mega.MegaApi, transfer mega.
 	if l.buffer != nil && len(buffer) > 0 {
 		l.buffer.WriteString(buffer)
 
+		// Throttle if appropriate
 		if err := l.CheckOnWrite(); err != nil {
 			fs.Errorf("MyMegaTransferListener", "CheckOnWrite error: %s", err.Error())
 		}
@@ -94,7 +95,7 @@ func (l *MyMegaTransferListener) Wait() {
 }
 
 func (l *MyMegaTransferListener) WaitStream() {
-	// Wait until notified becomes true
+	// Wait until ready becomes true
 	l.m.Lock()
 	defer l.m.Unlock()
 
