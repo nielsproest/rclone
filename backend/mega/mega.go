@@ -8,9 +8,6 @@ Open questions
 * Can mega support setting modification times?
 
 Improvements:
-* Uploads could be done in parallel
-* Downloads would be more efficient done in one go
-* Uploads would be more efficient with bigger chunks
 * Looks like mega can support server-side copy, but it isn't implemented in go-mega
 * Upload can set modtime... - set as int64_t - can set ctime and mtime?
 */
@@ -37,7 +34,6 @@ import (
 	"github.com/rclone/rclone/fs/hash"
 	"github.com/rclone/rclone/lib/encoder"
 	"github.com/rclone/rclone/lib/pacer"
-	"github.com/rclone/rclone/lib/readers"
 	mega "github.com/t3rm1n4l/go-mega"
 )
 
@@ -119,6 +115,48 @@ Enabling it will increase CPU usage and add network overhead.`,
 			Default:  false,
 			Advanced: true,
 		}, {
+			Name: "download_concurrency",
+			Help: `Number of HTTP requests to use for each download.
+
+Each download is fetched with up to this many concurrent HTTP requests
+of up to download_chunk_size. Downloads start with a single small
+request and ramp up as the data is read, so reading only the start of
+a file stays cheap.
+
+Higher values make downloads faster on high latency links at the cost
+of memory, as up to download_concurrency * download_chunk_size is
+buffered per download.`,
+			Default:  4,
+			Advanced: true,
+		}, {
+			Name: "download_chunk_size",
+			Help: `Maximum size of each HTTP request used for downloads.
+
+This is capped at 1 GiB. Larger requests are more efficient on high
+latency links but use more memory, see download_concurrency.`,
+			Default:  fs.SizeSuffix(8 * 1024 * 1024),
+			Advanced: true,
+		}, {
+			Name: "upload_concurrency",
+			Help: `Number of HTTP requests to use for each upload.
+
+Each upload is sent with this many concurrent HTTP requests of at
+least upload_chunk_size. Higher values make uploads faster on high
+latency links at the cost of memory, as up to
+(upload_concurrency + 1) * upload_chunk_size is buffered per upload.`,
+			Default:  4,
+			Advanced: true,
+		}, {
+			Name: "upload_chunk_size",
+			Help: `Minimum size of each HTTP request used for uploads.
+
+Requests are rounded up to the next MEGA chunk boundary, which is at
+most 1 MiB further, and this is capped at 1 GiB. Larger requests are
+more efficient on high latency links but use more memory, see
+upload_concurrency.`,
+			Default:  fs.SizeSuffix(8 * 1024 * 1024),
+			Advanced: true,
+		}, {
 			Name:     config.ConfigEncoding,
 			Help:     config.ConfigEncodingHelp,
 			Advanced: true,
@@ -131,15 +169,19 @@ Enabling it will increase CPU usage and add network overhead.`,
 
 // Options defines the configuration for this backend
 type Options struct {
-	User       string               `config:"user"`
-	Pass       string               `config:"pass"`
-	TwoFA      string               `config:"2fa"`
-	SessionID  string               `config:"session_id"`
-	MasterKey  string               `config:"master_key"`
-	Debug      bool                 `config:"debug"`
-	HardDelete bool                 `config:"hard_delete"`
-	UseHTTPS   bool                 `config:"use_https"`
-	Enc        encoder.MultiEncoder `config:"encoding"`
+	User                string               `config:"user"`
+	Pass                string               `config:"pass"`
+	TwoFA               string               `config:"2fa"`
+	SessionID           string               `config:"session_id"`
+	MasterKey           string               `config:"master_key"`
+	Debug               bool                 `config:"debug"`
+	HardDelete          bool                 `config:"hard_delete"`
+	UseHTTPS            bool                 `config:"use_https"`
+	DownloadConcurrency int                  `config:"download_concurrency"`
+	DownloadChunkSize   fs.SizeSuffix        `config:"download_chunk_size"`
+	UploadConcurrency   int                  `config:"upload_concurrency"`
+	UploadChunkSize     fs.SizeSuffix        `config:"upload_chunk_size"`
+	Enc                 encoder.MultiEncoder `config:"encoding"`
 }
 
 // Fs represents a remote mega
@@ -257,6 +299,14 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		srv = mega.New().SetClient(fshttp.NewClient(ctx))
 		srv.SetRetries(ci.LowLevelRetries) // let mega do the low level retries
 		srv.SetHTTPS(opt.UseHTTPS)
+		if err := srv.SetDownloadWorkers(opt.DownloadConcurrency); err != nil {
+			return nil, fmt.Errorf("bad download_concurrency %d: %w", opt.DownloadConcurrency, err)
+		}
+		srv.SetDownloadRequestSize(int64(opt.DownloadChunkSize))
+		if err := srv.SetUploadWorkers(opt.UploadConcurrency); err != nil {
+			return nil, fmt.Errorf("bad upload_concurrency %d: %w", opt.UploadConcurrency, err)
+		}
+		srv.SetUploadRequestSize(int64(opt.UploadChunkSize))
 		srv.SetLogger(func(format string, v ...any) {
 			fs.Infof("*go-mega*", format, v...)
 		})
@@ -1058,28 +1108,8 @@ type openObject struct {
 	mu     sync.Mutex
 	o      *Object
 	d      *mega.Download
-	id     int
-	skip   int64
-	chunk  []byte
+	in     io.ReadCloser
 	closed bool
-}
-
-// get the next chunk
-func (oo *openObject) getChunk(ctx context.Context) (err error) {
-	if oo.id >= oo.d.Chunks() {
-		return io.EOF
-	}
-	var chunk []byte
-	err = oo.o.fs.pacer.Call(func() (bool, error) {
-		chunk, err = oo.d.DownloadChunk(oo.id)
-		return shouldRetry(ctx, err)
-	})
-	if err != nil {
-		return err
-	}
-	oo.id++
-	oo.chunk = chunk
-	return nil
 }
 
 // Read reads up to len(p) bytes into p.
@@ -1089,31 +1119,7 @@ func (oo *openObject) Read(p []byte) (n int, err error) {
 	if oo.closed {
 		return 0, errors.New("read on closed file")
 	}
-	// Skip data at the start if requested
-	for oo.skip > 0 {
-		_, size, err := oo.d.ChunkLocation(oo.id)
-		if err != nil {
-			return 0, err
-		}
-		if oo.skip < int64(size) {
-			break
-		}
-		oo.id++
-		oo.skip -= int64(size)
-	}
-	if len(oo.chunk) == 0 {
-		err = oo.getChunk(oo.ctx)
-		if err != nil {
-			return 0, err
-		}
-		if oo.skip > 0 {
-			oo.chunk = oo.chunk[oo.skip:]
-			oo.skip = 0
-		}
-	}
-	n = copy(p, oo.chunk)
-	oo.chunk = oo.chunk[n:]
-	return n, nil
+	return oo.in.Read(p)
 }
 
 // Close closed the file - MAC errors are reported here
@@ -1122,6 +1128,10 @@ func (oo *openObject) Close() (err error) {
 	defer oo.mu.Unlock()
 	if oo.closed {
 		return nil
+	}
+	err = oo.in.Close()
+	if err != nil {
+		return fmt.Errorf("failed to close download: %w", err)
 	}
 	err = oo.o.fs.pacer.Call(func() (bool, error) {
 		err = oo.d.Finish()
@@ -1159,14 +1169,17 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.Read
 		return nil, fmt.Errorf("open download file failed: %w", err)
 	}
 
-	oo := &openObject{
-		ctx:  ctx,
-		o:    o,
-		d:    d,
-		skip: offset,
+	r, err := d.NewReader(ctx, offset, limit)
+	if err != nil {
+		return nil, fmt.Errorf("open download file failed: %w", err)
 	}
 
-	return readers.NewLimitedReadCloser(oo, limit), nil
+	return &openObject{
+		ctx: ctx,
+		o:   o,
+		d:   d,
+		in:  r,
+	}, nil
 }
 
 // Update the object with the contents of the io.Reader, modTime and size
@@ -1197,26 +1210,9 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 		return fmt.Errorf("upload file failed to create session: %w", err)
 	}
 
-	// Upload the chunks
-	// FIXME do this in parallel
-	for id := range u.Chunks() {
-		_, chunkSize, err := u.ChunkLocation(id)
-		if err != nil {
-			return fmt.Errorf("upload failed to read chunk location: %w", err)
-		}
-		chunk := make([]byte, chunkSize)
-		_, err = io.ReadFull(in, chunk)
-		if err != nil {
-			return fmt.Errorf("upload failed to read data: %w", err)
-		}
-
-		err = o.fs.pacer.Call(func() (bool, error) {
-			err = u.UploadChunk(id, chunk)
-			return shouldRetry(ctx, err)
-		})
-		if err != nil {
-			return fmt.Errorf("upload file failed to upload chunk: %w", err)
-		}
+	err = u.UploadFrom(ctx, 0, -1, in)
+	if err != nil {
+		return fmt.Errorf("upload file failed to upload data: %w", err)
 	}
 
 	waitEvent := o.fs.srv.WaitEventsStart()
